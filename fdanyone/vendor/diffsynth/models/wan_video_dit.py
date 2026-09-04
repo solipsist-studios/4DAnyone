@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,8 +32,44 @@ except (ImportError, OSError, RuntimeError):
     SPARGE_ATTN_AVAILABLE = False
 
 
-def get_attention_backend() -> str:
-    """Return the implementation selected by the vendored auto policy."""
+_ATTENTION_BACKENDS = ("flash_attn_3", "flash_attn_2", "sageattention", "sdpa")
+_ATTENTION_BACKEND_ENV = "FDANYONE_ATTENTION_BACKEND"
+_ATTENTION_BACKEND = None
+
+
+def _select_attention_backend() -> str:
+    """Local patch: allow FDANYONE_ATTENTION_BACKEND to override the auto policy.
+
+    The auto policy ranks by speed, but on a 32 GB card this pipeline is bound
+    by memory, not by time. Measured on an RTX 5090 (bf16, 24 heads, head_dim
+    128) sageattn peaks at exactly 2x the memory of torch SDPA -- it keeps
+    INT8 copies of q and k plus a smoothed k alongside the originals, whereas
+    SDPA already dispatches to the flash kernel and is O(N). Numbers for the
+    multiview-attention shape this model uses:
+
+        v=5 (RCP off)   SDPA +1.57 GiB  36 ms   sage +3.13 GiB  22 ms
+        v=6 (RCP on)    SDPA +1.89 GiB  50 ms   sage +3.75 GiB  31 ms
+
+    So on any machine where sageattention happens to be importable -- notably
+    a shared ComfyUI environment -- the auto policy silently costs ~1.9 GiB at
+    the exact moment RCP needs it. Set the variable to "sdpa" to opt out.
+    """
+
+    override = os.environ.get(_ATTENTION_BACKEND_ENV, "").strip().lower()
+    if override:
+        if override not in _ATTENTION_BACKENDS:
+            raise ValueError(
+                f"{_ATTENTION_BACKEND_ENV} must be one of {', '.join(_ATTENTION_BACKENDS)}, got {override!r}."
+            )
+        available = {
+            "flash_attn_3": FLASH_ATTN_3_AVAILABLE,
+            "flash_attn_2": FLASH_ATTN_2_AVAILABLE,
+            "sageattention": SAGE_ATTN_AVAILABLE,
+            "sdpa": True,
+        }
+        if not available[override]:
+            raise ValueError(f"{_ATTENTION_BACKEND_ENV}={override!r} but that backend is not importable.")
+        return override
 
     if FLASH_ATTN_3_AVAILABLE:
         return "flash_attn_3"
@@ -43,14 +80,27 @@ def get_attention_backend() -> str:
     return "sdpa"
 
 
+def get_attention_backend() -> str:
+    """Return the implementation selected by the vendored auto policy."""
+
+    global _ATTENTION_BACKEND
+    if _ATTENTION_BACKEND is None:
+        _ATTENTION_BACKEND = _select_attention_backend()
+    return _ATTENTION_BACKEND
+
+
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
+    # Local patch: dispatch on the resolved backend name rather than on the
+    # availability flags, so FDANYONE_ATTENTION_BACKEND actually takes effect.
+    # With the variable unset this reproduces the original branch order.
+    backend = get_attention_backend()
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
         x = F.scaled_dot_product_attention(q, k, v)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    elif FLASH_ATTN_3_AVAILABLE:
+    elif backend == "flash_attn_3":
         q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
@@ -58,7 +108,7 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         if isinstance(x,tuple):
             x = x[0]
         x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-    elif FLASH_ATTN_2_AVAILABLE:
+    elif backend == "flash_attn_2":
         q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
@@ -71,7 +121,7 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
     #     v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
     #     x = spas_sage2_attn_meansim_topk_cuda(q, k, v, simthreshd1=-0.1, topk=0.5, pvthreshd=15, is_causal=False)
     #     x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    elif SAGE_ATTN_AVAILABLE:
+    elif backend == "sageattention":
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
@@ -114,12 +164,35 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     return freqs_cis
 
 
+def _chunked_tokenwise(module, x, max_tokens=16384):
+    """Local patch: run a per-token module (the FFN) in sequence slices.
+
+    The FFN intermediate (tokens x ffn_dim) was a single 3.64 GiB allocation
+    at full sequence length. Every layer inside is pointwise per token, so
+    slicing the sequence dimension is bit-identical and bounds the temporary
+    to max_tokens rows."""
+    s = x.shape[1]
+    if s <= max_tokens:
+        return module(x)
+    return torch.cat([module(x[:, i:i + max_tokens]) for i in range(0, s, max_tokens)], dim=1)
+
+
 def rope_apply(x, freqs, num_heads):
+    # Local patch: the original upcast the WHOLE tensor to float64 (4x bf16)
+    # and built an equally large complex product -- a 3.12 GiB single
+    # allocation that OOMed a 32 GB card. RoPE is elementwise along the
+    # sequence dim (freqs indexes it), so apply it in sequence chunks with
+    # identical float64 math and write results into a bf16-sized output.
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    x_out = torch.view_as_complex(x.to(torch.float64).reshape(
-        x.shape[0], x.shape[1], x.shape[2], -1, 2))
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
+    b, s, n, d = x.shape
+    out = torch.empty_like(x)
+    # ~64M float64 elements per slice keeps the temporary under ~1 GiB
+    chunk = max(1, (1 << 26) // max(1, b * n * d))
+    for i in range(0, s, chunk):
+        piece = x[:, i:i + chunk].to(torch.float64)
+        piece = torch.view_as_complex(piece.reshape(b, piece.shape[1], n, -1, 2))
+        out[:, i:i + chunk] = torch.view_as_real(piece * freqs[i:i + chunk]).flatten(3).to(x.dtype)
+    return out.flatten(2)
 
 
 class RMSNorm(nn.Module):
@@ -133,6 +206,15 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         dtype = x.dtype
+        # Local patch: norm is pointwise per token, but x.float() upcast the
+        # whole (b, s, d) tensor at once -- a 1.88 GiB single allocation at
+        # 24-view sequence lengths. Slice the sequence dim; bit-identical.
+        # NB: the trailing multiply PROMOTES back to the weight's float32, so
+        # slices are concatenated rather than written into a bf16 buffer.
+        if x.dim() == 3 and x.shape[1] > 16384:
+            return torch.cat(
+                [self.norm(x[:, i:i + 16384].float()).to(dtype) * self.weight
+                 for i in range(0, x.shape[1], 16384)], dim=1)
         return self.norm(x.float()).to(dtype) * self.weight
 
 
@@ -346,14 +428,14 @@ class DiTBlock(nn.Module):
 
         # feed-forward network
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = self.gate(x, gate_mlp, self.ffn(input_x))
+        x = self.gate(x, gate_mlp, _chunked_tokenwise(self.ffn, input_x))
 
         if self.use_src_self_attn:
             # for src self-attention, the x_src is updated as well
             x_src = x_src + self.cross_attn(self.norm3(x_src), context)
 
             input_x_src = modulate(self.norm2(x_src), shift_mlp, scale_mlp)
-            x_src = self.gate(x_src, gate_mlp, self.ffn(input_x_src))
+            x_src = self.gate(x_src, gate_mlp, _chunked_tokenwise(self.ffn, input_x_src))
 
         return x, x_src
 
@@ -632,7 +714,13 @@ class WanModel(torch.nn.Module):
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
 
         if self.use_pose_encoder:
-            skeleton_latents = self.pose_encoder(skeletons)
+            # Local patch: encode per view instead of one all-views batch. The
+            # batched Conv3d activations peaked at 4.37 GiB, which OOMed a
+            # 32 GB card; per-view chunks cut the peak ~7x for negligible cost
+            # (the encoder is a small conv stack inside the denoise loop).
+            skeleton_latents = torch.cat(
+                [self.pose_encoder(skeletons[i:i + 1]) for i in range(skeletons.shape[0])],
+                dim=0)
             skeleton_tokens = rearrange(skeleton_latents, "v c f h w -> v (f h w) c")
             x = x + skeleton_tokens
 

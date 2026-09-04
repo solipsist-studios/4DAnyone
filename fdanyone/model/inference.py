@@ -92,7 +92,14 @@ def _encode_prompt(pipe, device: str) -> dict[str, object]:
 
     _move_model(pipe.text_encoder, device)
     with torch.inference_mode(), _bf16_autocast():
-        context = pipe.prompter.encode_prompt(INFERENCE.prompt, positive=True, device=device)
+        # Local patch: FDANYONE_PROMPT overrides the frozen prompt so a LoRA
+        # trigger word can reach cross-attention. umt5-xxl is multilingual, so
+        # mixing a trigger token with the stock Chinese prompt is fine.
+        import os
+        prompt_text = os.environ.get("FDANYONE_PROMPT", "").strip() or INFERENCE.prompt
+        if prompt_text != INFERENCE.prompt:
+            print(f"[fdanyone-local] prompt override: {prompt_text!r}", flush=True)
+        context = pipe.prompter.encode_prompt(prompt_text, positive=True, device=device)
     prompt = {"context": context.detach().to("cpu")}
     _offload_model(pipe.text_encoder)
     return prompt

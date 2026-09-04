@@ -212,7 +212,19 @@ def _load_data(cfg):
     paths = cfg.paths
     length, width, height = get_video_lwh(cfg.video_path)
     rotation_world_to_camera = torch.eye(3).repeat(length, 1, 1)
-    intrinsics = estimate_K(width, height).repeat(length, 1, 1)
+    import os
+    k_env = os.environ.get("FDANYONE_K_FULLIMG")
+    if k_env:
+        # Local patch: true intrinsics for the input video. estimate_K's
+        # diagonal heuristic was 3.1x off on a telephoto-ish rig crop, scaling
+        # every GVHMR depth by the same factor.
+        fx, fy, cx, cy = (float(v) for v in k_env.split(","))
+        K = torch.eye(3)
+        K[0, 0], K[1, 1], K[0, 2], K[1, 2] = fx, fy, cx, cy
+        print(f"[fdanyone-local] K_fullimg override: fx={fx} fy={fy} cx={cx} cy={cy}", flush=True)
+        intrinsics = K.repeat(length, 1, 1)
+    else:
+        intrinsics = estimate_K(width, height).repeat(length, 1, 1)
     return {
         "length": torch.tensor(length),
         "bbx_xys": torch.load(paths.bbx, weights_only=True)["bbx_xys"],

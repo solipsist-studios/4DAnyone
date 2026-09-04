@@ -59,7 +59,9 @@ class WanVideoSpaTemPipeline(BasePipeline):
             self.dit,
             module_map={
                 torch.nn.Linear: AutoWrappedLinear,
-                torch.nn.Conv3d: AutoWrappedModule,
+                # Local patch: Conv3d deliberately NOT wrapped. The DiT's convs
+                # are small patch/viewpack embeddings, and the viewpack path
+                # introspects their .kernel_size, which the wrapper hides.
                 torch.nn.LayerNorm: AutoWrappedModule,
                 RMSNorm: AutoWrappedModule,
             },

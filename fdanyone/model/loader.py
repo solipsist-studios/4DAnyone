@@ -69,6 +69,46 @@ def _strict_assign(module, state_dict: dict, label: str) -> None:
         )
 
 
+def _merge_lora_factors(state_dict) -> None:
+    """Local patch: merge pre-folded LoRA factors into the DiT weights.
+
+    ``FDANYONE_LORA_PATH`` names a safetensors file holding, per targeted
+    weight, ``<key>.up`` [out, r] and ``<key>.down`` [r, in] -- strength and
+    alpha already folded in by the producer (the comfyui-4danyone bridge, from
+    a standard ComfyUI LoRA-loader stack). The merge is ``W += up @ down`` on
+    CPU before weights reach the device, so it costs no VRAM and the rest of
+    the pipeline sees an ordinary checkpoint. Unset leaves behaviour unchanged.
+    """
+
+    import os
+
+    lora_path = os.environ.get("FDANYONE_LORA_PATH", "").strip()
+    if not lora_path:
+        return
+    import torch
+    from safetensors.torch import load_file
+
+    factors = load_file(lora_path)
+    bases = sorted({k[: -len(".up")] for k in factors if k.endswith(".up")})
+    merged, missing = 0, []
+    for base in bases:
+        key = f"{base}.weight"
+        if key not in state_dict:
+            missing.append(base)
+            continue
+        weight = state_dict[key]
+        delta = factors[f"{base}.up"].to(torch.float32) @ factors[f"{base}.down"].to(torch.float32)
+        if delta.shape != weight.shape:
+            raise ValueError(
+                f"LoRA delta shape {tuple(delta.shape)} does not match {key} {tuple(weight.shape)}."
+            )
+        state_dict[key] = (weight.to(torch.float32) + delta).to(weight.dtype)
+        merged += 1
+    print(f"[fdanyone-local] merged LoRA factors into {merged} weights from {lora_path}", flush=True)
+    if missing:
+        print(f"[fdanyone-local] WARNING: {len(missing)} LoRA keys had no matching weight, e.g. {missing[:3]}", flush=True)
+
+
 def _load_dit(checkpoint_path: Path, dtype):
     import torch
 
@@ -95,6 +135,7 @@ def _load_dit(checkpoint_path: Path, dtype):
             use_lbm=INFERENCE.use_lbm,
         )
     state_dict = _load_checkpoint(checkpoint_path)
+    _merge_lora_factors(state_dict)
     _strict_assign(dit, state_dict, "4DAnyone DiT checkpoint")
     del state_dict
     # ``freqs`` is a derived, non-persistent tensor and therefore is not in the
@@ -256,4 +297,17 @@ def load_pipeline(
     pipe.prompter.fetch_models(pipe.text_encoder)
     pipe.height_division_factor = pipe.vae.upsampling_factor * 2
     pipe.width_division_factor = pipe.vae.upsampling_factor * 2
+
+    # Local patch: the vendored diffsynth ships full layer-streaming VRAM
+    # management (upstream's low-memory TODO) but nothing ever enables it.
+    # FDANYONE_PERSISTENT_PARAMS keeps that many DiT parameters resident and
+    # streams the rest from CPU per layer; unset leaves behaviour unchanged.
+    import os
+    persistent = os.environ.get("FDANYONE_PERSISTENT_PARAMS")
+    if persistent:
+        n = int(float(persistent))
+        print(f"[fdanyone-local] enabling layer-streaming, persistent DiT params: {n:,}", flush=True)
+        pipe.enable_vram_management(num_persistent_param_in_dit=n)
+        print("[fdanyone-local] layer-streaming enabled", flush=True)
+
     return LoadedPipeline(pipe=pipe)
