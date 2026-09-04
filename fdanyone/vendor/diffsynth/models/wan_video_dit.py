@@ -10,6 +10,7 @@ runtime.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -56,14 +57,43 @@ NORM_MODULATION_FP32_TEMPORARY_BUDGET_BYTES = 1536 * 1024**2
 ATTENTION_BACKEND_PRIORITY = ("flash_attn_3", "sageattention", "sdpa")
 
 
+ATTENTION_BACKEND_ENV = "FDANYONE_ATTENTION_BACKEND"
+
+
 def get_attention_backend() -> str:
-    """Return the implementation selected by the release auto policy."""
+    """Return the implementation selected by the release auto policy.
+
+    ``FDANYONE_ATTENTION_BACKEND`` pins one backend instead. The auto policy
+    ranks by speed, but this pipeline is bound by memory rather than by time.
+    Measured on an RTX 5090 (bf16, 24 heads, head_dim 128), sageattn peaks at
+    exactly 2x the memory of torch SDPA -- it holds INT8 copies of q and k plus
+    a smoothed k alongside the originals, whereas SDPA already dispatches to
+    the flash kernel and is O(N). For the multiview-attention shape this model
+    uses::
+
+        v=5 (RCP off)   SDPA +1.57 GiB  36 ms   sage +3.13 GiB  22 ms
+        v=6 (RCP on)    SDPA +1.89 GiB  50 ms   sage +3.75 GiB  31 ms
+
+    So wherever sageattention merely happens to be importable -- a shared
+    ComfyUI environment, say -- the auto policy silently costs ~1.9 GiB at the
+    moment RCP needs it. Set the variable to "sdpa" to opt out.
+    """
 
     availability = {
         "flash_attn_3": FLASH_ATTN_3_AVAILABLE,
         "sageattention": SAGE_ATTN_AVAILABLE,
         "sdpa": True,
     }
+    override = os.environ.get(ATTENTION_BACKEND_ENV, "").strip().lower()
+    if override:
+        if override not in ATTENTION_BACKEND_PRIORITY:
+            raise ValueError(
+                f"{ATTENTION_BACKEND_ENV} must be one of "
+                f"{', '.join(ATTENTION_BACKEND_PRIORITY)}, got {override!r}."
+            )
+        if not availability[override]:
+            raise ValueError(f"{ATTENTION_BACKEND_ENV}={override!r} but that backend is not importable.")
+        return override
     return next(backend for backend in ATTENTION_BACKEND_PRIORITY if availability[backend])
 
 

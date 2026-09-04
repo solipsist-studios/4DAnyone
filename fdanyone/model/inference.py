@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import math
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -433,7 +434,14 @@ def generate_views(
     metrics = GenerationMetrics(plan.primary_device_index)
 
     with metrics.stage("prompt"):
-        context = load_prompt_context(assets.prompt_context)
+        # Local patch: FDANYONE_PROMPT_CONTEXT points at an alternative frozen
+        # UMT5 encoding, so a LoRA trigger word can reach cross-attention
+        # without reviving the text encoder this pipeline no longer loads.
+        # Produce the file with the same encoder the bundled one came from.
+        prompt_context = os.environ.get("FDANYONE_PROMPT_CONTEXT", "").strip() or assets.prompt_context
+        if prompt_context != assets.prompt_context:
+            LOGGER.info("Prompt conditioning overridden by FDANYONE_PROMPT_CONTEXT: %s", prompt_context)
+        context = load_prompt_context(prompt_context)
 
     with metrics.stage("pose_conditioning"):
         pose_cache = build_pose_feature_cache(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -14,6 +16,8 @@ if TYPE_CHECKING:
     from torch import nn
 
     from fdanyone.vendor.diffsynth.schedulers.flow_match import FlowMatchScheduler
+
+LOGGER = logging.getLogger("fdanyone")
 
 POSE_ENCODER_PREFIX = "pose_encoder."
 
@@ -79,6 +83,55 @@ def _strict_assign(module, state_dict: dict, label: str) -> None:
         )
 
 
+def _merge_lora_factors(state_dict: dict) -> None:
+    """Merge pre-folded LoRA factors named by ``FDANYONE_LORA_PATH``.
+
+    The file is a safetensors checkpoint holding, per targeted weight,
+    ``<key>.up`` [out, r] and ``<key>.down`` [r, in], with strength and alpha
+    already folded in by the producer. The merge is ``W += up @ down`` on CPU
+    before weights reach the device, so it costs no VRAM and the rest of the
+    pipeline sees an ordinary checkpoint. Unset leaves behaviour unchanged.
+    """
+
+    lora_path = os.environ.get("FDANYONE_LORA_PATH", "").strip()
+    if not lora_path:
+        return
+
+    import torch
+
+    try:
+        from safetensors.torch import load_file
+    except ImportError as exc:
+        raise AssetError("safetensors is required to merge LoRA factors.") from exc
+
+    resolved = Path(lora_path).expanduser().resolve()
+    if not resolved.is_file():
+        raise AssetError(f"FDANYONE_LORA_PATH does not exist: {resolved}")
+
+    factors = load_file(str(resolved))
+    bases = sorted({key[: -len(".up")] for key in factors if key.endswith(".up")})
+    merged: int = 0
+    missing: list[str] = []
+    for base in bases:
+        key = f"{base}.weight"
+        if key not in state_dict:
+            missing.append(base)
+            continue
+        weight = state_dict[key]
+        delta = factors[f"{base}.up"].to(torch.float32) @ factors[f"{base}.down"].to(torch.float32)
+        if delta.shape != weight.shape:
+            raise AssetError(
+                f"LoRA delta shape {tuple(delta.shape)} does not match {key} {tuple(weight.shape)}."
+            )
+        state_dict[key] = (weight.to(torch.float32) + delta).to(weight.dtype)
+        merged += 1
+    LOGGER.info("Merged LoRA factors into %d weights from %s", merged, resolved)
+    if missing:
+        LOGGER.warning(
+            "%d LoRA keys had no matching weight, e.g. %s", len(missing), ", ".join(missing[:3])
+        )
+
+
 def _load_dit(checkpoint_path: Path):
     import torch
 
@@ -92,6 +145,7 @@ def _load_dit(checkpoint_path: Path):
     with torch.device("meta"):
         dit = FourDAnyoneDiT()
     state_dict, metadata = _load_checkpoint(checkpoint_path, exclude_prefixes=(POSE_ENCODER_PREFIX,))
+    _merge_lora_factors(state_dict)
     _strict_assign(dit, state_dict, "4DAnyone DiT checkpoint")
     del state_dict
     # ``freqs`` is a derived, non-persistent tensor and therefore is not in the

@@ -12,6 +12,7 @@ import importlib
 import importlib.util
 import itertools
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -26,6 +27,8 @@ from fdanyone.errors import AssetError, VideoContractError
 from fdanyone.motion.result import SMPL_PARAMETER_NAMES, MotionResult
 from fdanyone.vendor.pytorch3d_compat import install_if_needed as install_pytorch3d_compat
 from fdanyone.video import CanonicalClip
+
+LOGGER = logging.getLogger("fdanyone")
 
 GVHMR_ASSETS = (
     "inputs/checkpoints/gvhmr/gvhmr_siga24_release.ckpt",
@@ -245,7 +248,24 @@ def _load_data(cfg):
     paths = cfg.paths
     length, width, height = get_video_lwh(cfg.video_path)
     rotation_world_to_camera = torch.eye(3).repeat(length, 1, 1)
-    intrinsics = estimate_K(width, height).repeat(length, 1, 1)
+    # ``FDANYONE_K_FULLIMG`` supplies the true intrinsics as "fx,fy,cx,cy".
+    # estimate_K's diagonal heuristic was 3.1x off on a telephoto-ish rig crop,
+    # which scaled every GVHMR depth by that same factor.
+    k_override = os.environ.get("FDANYONE_K_FULLIMG", "").strip()
+    if k_override:
+        try:
+            fx, fy, cx, cy = (float(value) for value in k_override.split(","))
+        except ValueError as exc:
+            raise VideoContractError(
+                f'FDANYONE_K_FULLIMG must be "fx,fy,cx,cy", got {k_override!r}.'
+            ) from exc
+        intrinsics = torch.eye(3)
+        intrinsics[0, 0], intrinsics[1, 1] = fx, fy
+        intrinsics[0, 2], intrinsics[1, 2] = cx, cy
+        LOGGER.info("Camera intrinsics overridden: fx=%s fy=%s cx=%s cy=%s", fx, fy, cx, cy)
+        intrinsics = intrinsics.repeat(length, 1, 1)
+    else:
+        intrinsics = estimate_K(width, height).repeat(length, 1, 1)
     return {
         "length": torch.tensor(length),
         "bbx_xys": torch.load(paths.bbx, weights_only=True)["bbx_xys"],
