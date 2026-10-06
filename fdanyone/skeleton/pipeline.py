@@ -25,7 +25,7 @@ from fdanyone.geometry.cameras import (
     reference_intrinsics,
 )
 from fdanyone.geometry.crop import Crop, center_crop, crop_from_bounds, mask_bounds, transform_intrinsics
-from fdanyone.geometry.framing import analyze_input_framing, solve_sequence_framing
+from fdanyone.geometry.framing import analyze_input_framing, solve_clip_framing
 from fdanyone.io import write_json
 from fdanyone.motion.gvhmr import gvhmr_imports, validate_gvhmr
 from fdanyone.motion.result import MotionResult
@@ -125,6 +125,8 @@ class _BodyGeometry:
     keypoints_incam: np.ndarray
     motion_world_to_canonical_world: np.ndarray
     regressor_metadata: dict[str, int | str]
+    mesh_world: np.ndarray | None = None
+    mesh_faces: np.ndarray | None = None
 
 
 def _video_tensor(path: Path, num_frames: int, *, crop: Crop | None = None):
@@ -157,8 +159,7 @@ def _video_tensor(path: Path, num_frames: int, *, crop: Crop | None = None):
     return torch.stack(output_frames, dim=1).unsqueeze(0).contiguous()
 
 
-def _safe_regressor_metadata(raw_metadata: object, support_shape: tuple[int, ...]) -> dict[str, int | str]:
-    del raw_metadata
+def _safe_regressor_metadata(support_shape: tuple[int, ...]) -> dict[str, int | str]:
     return {
         "format": "sparse_vertex_regressor",
         "num_keypoints": int(support_shape[0]),
@@ -177,7 +178,7 @@ def _load_regressor(path: Path, device):
         raise AssetError(f"Unexpected MHR70 regressor shapes: support={support.shape}, weights={weights.shape}.")
     if names != KEYPOINT_NAMES:
         raise AssetError("MHR70 regressor keypoint order does not match the frozen Goliath70 schema.")
-    return support, weights, _safe_regressor_metadata(data.get("metadata"), tuple(support.shape))
+    return support, weights, _safe_regressor_metadata(tuple(support.shape))
 
 
 @contextmanager
@@ -192,6 +193,8 @@ def _body_geometry(
     regressor_path: Path,
     gvhmr_root: Path,
     device: str,
+    *,
+    include_mesh: bool = False,
 ) -> _BodyGeometry:
     import torch
 
@@ -239,6 +242,12 @@ def _body_geometry(
         vertices_world = apply_T_on_points(vertices_offset, transform)
         keypoints_world = apply_T_on_points(keypoints_global - offset, transform)
         joints_world = torch.einsum("jv,lvi->lji", joint_regressor, vertices_world)
+        mesh_world = (
+            apply_T_on_points(vertices_global - offset, transform).detach().cpu().numpy().astype(np.float32)
+            if include_mesh
+            else None
+        )
+        mesh_faces = np.asarray(smplx.faces, dtype=np.uint32) if include_mesh else None
 
     world_transform = transform[0].detach().clone()
     world_transform[:3, 3] -= world_transform[:3, :3] @ offset
@@ -249,6 +258,8 @@ def _body_geometry(
         keypoints_incam.detach().cpu().numpy().astype(np.float32),
         world_transform.detach().cpu().numpy().astype(np.float64),
         regressor_metadata,
+        mesh_world,
+        mesh_faces,
     )
     del smplx, vertices_global, vertices_incam, vertices_smpl, vertices_world, keypoints_global, keypoints_world
     torch.cuda.empty_cache()
@@ -379,7 +390,7 @@ def build_skeleton_conditioning(
         )
 
     projection_height, projection_width = _projection_shape(clip.height, clip.width)
-    framing = solve_sequence_framing(
+    framing = solve_clip_framing(
         geometry.keypoints_world,
         KEYPOINT_NAMES,
         input_framing,

@@ -23,6 +23,8 @@ from fdanyone.nerfstudio.visual_hull import (
     build_sparse_point_cloud,
     write_sparse_point_cloud,
 )
+from fdanyone.output_directory import read_output_metadata
+from fdanyone.result_videos import read_target_videos
 
 # Nerfstudio casts mask pixels directly to bool, so soft BiRefNet predictions
 # must cross a real decision boundary before serialization.
@@ -70,17 +72,6 @@ def _extract_frame(video_path: Path, frame_index: int) -> np.ndarray:
     if image is None:
         raise FourDAnyoneError(f"Video {video_path} has no frame {frame_index}.")
     return image
-
-
-def _dense_video_paths(result: Path, cameras: list[dict]) -> tuple[Path, ...]:
-    paths = []
-    for camera in cameras:
-        camera_id = int(camera["camera_id"])
-        relative = f"videos/dense/{camera_id:02d}.mp4"
-        if camera.get("video") != relative:
-            raise FourDAnyoneError(f"Camera {camera_id:02d} points to the wrong target video.")
-        paths.append(result / relative)
-    return tuple(paths)
 
 
 def _validate_raster(image: np.ndarray, camera: dict) -> None:
@@ -162,37 +153,38 @@ def _transforms(cameras: list[dict]) -> dict:
 
 
 def export_nerfstudio(
-    result_dir: str,
-    frame_index: int = 0,
+    data_dir: str,
     output_dir: str | None = None,
+    frame_index: int = 0,
     model_dir: str = "models",
     device: str = "cuda:0",
 ) -> dict:
     """Export one masked multi-view timestamp and visual hull for Nerfstudio.
 
     Args:
-        result_dir: A completed data/fdanyone/<clip> result.
+        data_dir: Completed 4DAnyone output directory for one clip.
+        output_dir: Dataset directory. Defaults to data/ns_data/<clip>/frame_NNN.
         frame_index: Synchronized frame index from 0 through 120.
-        output_dir: Destination; defaults to data/nerfstudio/<clip>/frame_NNN.
         model_dir: Model root containing (or receiving) the pinned BiRefNet files.
         device: CUDA device used for foreground segmentation.
     """
 
-    result = Path(result_dir).expanduser().resolve()
+    result = Path(data_dir).expanduser().resolve()
     if not result.is_dir():
         raise FourDAnyoneError(f"4DAnyone result does not exist: {result}")
     if not 0 <= frame_index < INFERENCE.num_frames:
         raise FourDAnyoneError(f"frame_index must be in [0, {INFERENCE.num_frames - 1}], got {frame_index}.")
+    read_output_metadata(result)
     cameras = _camera_records(_read_cameras(result))
     transforms = _transforms(cameras)
-    videos = _dense_video_paths(result, cameras)
+    videos = read_target_videos(result, cameras)
 
     if output_dir is None:
-        data_root = result.parent.parent if result.parent.name == "fdanyone" else result.parent
-        destination = data_root / "nerfstudio" / result.name / f"frame_{frame_index:03d}"
+        destination = Path("data/ns_data") / result.name / f"frame_{frame_index:03d}"
     else:
-        destination = Path(output_dir).expanduser().resolve()
+        destination = Path(output_dir)
     atomic = AtomicResultDirectory(destination)
+    destination = atomic.destination
     if os.path.lexists(atomic.destination):
         raise FourDAnyoneError(f"Nerfstudio dataset already exists: {atomic.destination}")
 
@@ -207,7 +199,6 @@ def export_nerfstudio(
         masks = predict_foreground_masks(images, foreground_model, device)
         binary_masks = _write_masks(masks, images, work / "masks")
         _write_images(images, binary_masks, work / "images")
-        del foreground_model
         points, colors = build_sparse_point_cloud(images, binary_masks, cameras, device)
         write_sparse_point_cloud(work / NERFSTUDIO_POINT_CLOUD, points, colors)
         write_json(work / "transforms.json", transforms, sort_keys=False)

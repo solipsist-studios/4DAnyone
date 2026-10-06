@@ -23,7 +23,6 @@ class InferenceConfig:
         (30000, 1001),
     )
     temporal_sampling_policy: str = "nearest_source_pts_on_zero_based_cfr_clock"
-    rcp_jpeg_quality: int = 85
     skeleton_h264_crf: int = 17
     target_h264_crf: int = 18
     h264_preset: str = "medium"
@@ -85,7 +84,7 @@ class ForegroundConfig:
 
 @dataclass(frozen=True)
 class FramingConfig:
-    """Sequence-level camera solve matching the current GVHMR demo."""
+    """Clip-wide camera solve matching the current GVHMR demo."""
 
     reference_radius: float = 3.0
     reference_target_height: float = 1.0

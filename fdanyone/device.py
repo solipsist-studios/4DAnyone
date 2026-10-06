@@ -10,7 +10,7 @@ from fdanyone.errors import ConfigurationError
 
 CUDA_ALLOCATOR_CONF = "PYTORCH_CUDA_ALLOC_CONF"
 CUDA_MAX_SPLIT_SIZE_MB = 4096
-CUDA_EXPANDABLE_SEGMENT_MAX_MEMORY_BYTES = 24 * 1024**3
+LOW_MEMORY_GPU_MAX_BYTES = 24 * 1024**3
 
 
 def _visible_gpu_identifiers(environment: MutableMapping[str, str]) -> tuple[str, ...] | None:
@@ -66,7 +66,7 @@ def _query_total_memory_bytes(identifiers: tuple[str, ...] | None) -> tuple[int,
     return tuple(total_mib * 1024**2 for total_mib in totals_mib)
 
 
-def selected_gpus_need_expandable_segments(
+def has_low_memory_gpu(
     gpu_ids: Sequence[int] | None,
     environment: MutableMapping[str, str] | None = None,
 ) -> bool:
@@ -75,7 +75,7 @@ def selected_gpus_need_expandable_segments(
     environment = os.environ if environment is None else environment
     identifiers = _selected_gpu_identifiers(gpu_ids, environment)
     totals = _query_total_memory_bytes(identifiers)
-    return bool(totals) and any(total <= CUDA_EXPANDABLE_SEGMENT_MAX_MEMORY_BYTES for total in totals)
+    return any(total <= LOW_MEMORY_GPU_MAX_BYTES for total in totals)
 
 
 def configure_inference_cuda_allocator(
@@ -121,16 +121,12 @@ def select_cuda_device(device: str) -> tuple[str, int]:
     return f"cuda:{index}", index
 
 
-def select_cuda_devices(gpu_ids: Sequence[int] | None = None) -> tuple[str, ...]:
-    """Select an ordered set of CUDA-visible devices for one inference run."""
-
-    import torch
-
-    if not torch.cuda.is_available() or torch.cuda.device_count() <= 0:
+def validate_gpu_ids(gpu_ids: Sequence[int] | None, available: int) -> tuple[int, ...]:
+    """Validate logical indices without initializing CUDA or selecting a device."""
+    if available <= 0:
         raise ConfigurationError("4DAnyone requires at least one available CUDA device.")
-
     if gpu_ids is None:
-        selected = tuple(range(torch.cuda.device_count()))
+        selected = tuple(range(available))
     else:
         if isinstance(gpu_ids, (str, bytes)) or not isinstance(gpu_ids, Sequence) or not gpu_ids:
             raise ConfigurationError("gpu_ids must be a non-empty list of CUDA-visible device IDs.")
@@ -141,11 +137,18 @@ def select_cuda_devices(gpu_ids: Sequence[int] | None = None) -> tuple[str, ...]
         if len(set(selected)) != len(selected):
             raise ConfigurationError(f"gpu_ids must not contain duplicates, got {list(selected)!r}.")
 
-    available = torch.cuda.device_count()
     unavailable = [gpu_id for gpu_id in selected if gpu_id < 0 or gpu_id >= available]
     if unavailable:
         raise ConfigurationError(
             f"gpu_ids contains unavailable CUDA-visible device IDs {unavailable}; visible device count is {available}."
         )
+    return selected
+
+
+def select_cuda_devices(gpu_ids: Sequence[int] | None = None) -> tuple[str, ...]:
+    """Select an ordered set of CUDA-visible devices for one inference run."""
+    import torch
+
+    selected = validate_gpu_ids(gpu_ids, torch.cuda.device_count() if torch.cuda.is_available() else 0)
     torch.cuda.set_device(selected[0])
     return tuple(f"cuda:{gpu_id}" for gpu_id in selected)
