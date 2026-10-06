@@ -72,6 +72,14 @@ class ViewPlan:
         return RCP_CAMERA_ORDER if self.enable_rcp else ()
 
     @property
+    def rcp2_camera_ids(self) -> tuple[int, ...]:
+        """A second proposal round exists in the SplatKit fork this pose path came from; it is
+        off there by default and not ported here. Skeleton conditioning still asks for the
+        ids, and none is the answer it gets when the round is off."""
+
+        return ()
+
+    @property
     def is_canonical_target_ring(self) -> bool:
         return (
             self.views_per_layer == CAMERA.count

@@ -122,7 +122,38 @@ class SkeletonConfig:
     draw_body_reference_px: float = 640.0
 
 
-INFERENCE = InferenceConfig()
+# Env overrides keep the frozen defaults intact for CLI users while letting the ComfyUI
+# wrapper request a different clip length or a tiled VAE per run. The denoising profile is
+# deliberately NOT selected here: upstream threads it explicitly through run_pipeline, which
+# is the better design, and inference.py maps FDANYONE_TURBO onto that parameter.
+import os as _os
+
+
+def _env_int(name: str, default: int) -> int:
+    value = _os.environ.get(name, "").strip()
+    return int(value) if value else default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = _os.environ.get(name, "").strip()
+    return float(value) if value else default
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = _os.environ.get(name, "").strip().lower()
+    return value in ("1", "true", "yes", "on") if value else default
+
+
+_num_frames = _env_int("FDANYONE_NUM_FRAMES", 121)
+INFERENCE = InferenceConfig(
+    num_frames=_num_frames,
+    # The VAE decode of the reference stage is the largest single spike in the pipeline and
+    # is untiled by default. Tiling it is what let a run finish while another program held
+    # the card.
+    tiled_vae=_env_flag("FDANYONE_TILED_VAE"),
+)
+if (INFERENCE.num_frames - 1) % 4:
+    raise ValueError(f"FDANYONE_NUM_FRAMES must be 4k+1 (VAE temporal factor), got {INFERENCE.num_frames}.")
 BASE24 = DenoisingProfile(
     name="base24",
     num_inference_steps=24,
@@ -141,6 +172,50 @@ RANK64_DELTA4 = DenoisingProfile(
 )
 CAMERA = CameraConfig()
 FOREGROUND = ForegroundConfig()
-FRAMING = FramingConfig()
+# How much of the frame the subject fills. The model output is a fixed 704x1280, so this
+# is the only knob that changes how many pixels land on the person, which is where our
+# quality is weakest (faces and hands). 0.80 is the upstream default; width_target_ratio
+# is already 0.90, so moving height into that range stays inside the framing distribution
+# the adaptive solver produces for other inputs.
+FRAMING = FramingConfig(
+    height_target_ratio=_env_float("FDANYONE_HEIGHT_TARGET_RATIO", 0.80),
+    width_target_ratio=_env_float("FDANYONE_WIDTH_TARGET_RATIO", 0.90),
+)
 CROP = CropConfig()
 SKELETON = SkeletonConfig()
+
+
+def _env_str(name: str, default: str = "") -> str:
+    return _os.environ.get(name, "").strip() or default
+
+
+@dataclass(frozen=True)
+class Sam3dConfig:
+    """Where to find SAM 3D Body, which replaces GVHMR and SMPL-X.
+
+    The model ships inside ComfyUI rather than as a package, and it needs that checkout's
+    own interpreter, so these are paths rather than imports. It is the same shape as the
+    existing worker-subprocess arrangement: a separate environment, invoked by path.
+
+    All three are environment-overridable because they are machine-specific. A missing or
+    wrong path fails at the start of a run with a message naming the variable, not halfway
+    through.
+    """
+
+    comfy_root: str = _env_str("FDANYONE_SAM3D_COMFY_ROOT")
+    python: str = _env_str("FDANYONE_SAM3D_PYTHON")
+    weights: str = _env_str("FDANYONE_SAM3D_WEIGHTS")
+    smooth_window: int = _env_int("FDANYONE_SAM3D_SMOOTH", 9)
+    batch_size: int = _env_int("FDANYONE_SAM3D_BATCH", 16)
+    fov_degrees: float = _env_float("FDANYONE_SAM3D_FOV", 0.0)
+
+    def resolved_weights(self) -> str:
+        if self.weights:
+            return self.weights
+        if self.comfy_root:
+            return str(_os.path.join(self.comfy_root, "models", "detection",
+                                     "sam_3d_body_dinov3_bf16.safetensors"))
+        return ""
+
+
+SAM3D = Sam3dConfig()

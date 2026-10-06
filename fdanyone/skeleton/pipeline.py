@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterable
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -13,7 +12,7 @@ import numpy as np
 
 from fdanyone.assets import BIREFNET_REPO_ID, BIREFNET_REVISION
 from fdanyone.config import CAMERA, CROP, FOREGROUND, INFERENCE, SKELETON, CameraConfig
-from fdanyone.errors import AssetError, FourDAnyoneError
+from fdanyone.errors import FourDAnyoneError
 from fdanyone.foreground import predict_foreground_masks
 from fdanyone.geometry.cameras import (
     CAMERA_FRAME,
@@ -27,11 +26,9 @@ from fdanyone.geometry.cameras import (
 from fdanyone.geometry.crop import Crop, center_crop, crop_from_bounds, mask_bounds, transform_intrinsics
 from fdanyone.geometry.framing import analyze_input_framing, solve_clip_framing
 from fdanyone.io import write_json
-from fdanyone.motion.gvhmr import gvhmr_imports, validate_gvhmr
 from fdanyone.motion.result import MotionResult
 from fdanyone.skeleton.keypoints import KEYPOINT_NAMES
 from fdanyone.skeleton.renderer import estimate_body_height, projected_body_scales, render_goliath40
-from fdanyone.vendor.pytorch3d_compat import install_if_needed as install_pytorch3d_compat
 from fdanyone.video import CanonicalClip, iter_rgb_video, write_lossless_video, write_video
 from fdanyone.views import ViewPlan
 
@@ -55,6 +52,8 @@ class Conditioning:
     fps_num: int
     fps_den: int
     num_frames: int
+    # Second RCP round; empty unless the view plan enables it.
+    rcp2_skeletons: tuple[SkeletonVideo, ...] = ()
 
     def load_source_tensor(self):
         return _video_tensor(self.source_video, self.num_frames, crop=self.source_crop)
@@ -89,6 +88,9 @@ class Conditioning:
         rcp_records = camera_payload.get("rcp_cameras", [])
         if [int(record["camera_id"]) for record in rcp_records] != list(view_plan.rcp_camera_ids):
             raise FourDAnyoneError("RCP conditioning cameras do not match the resolved view plan.")
+        rcp2_records = camera_payload.get("rcp2_cameras", [])
+        if [int(record["camera_id"]) for record in rcp2_records] != list(view_plan.rcp2_camera_ids):
+            raise FourDAnyoneError("RCP round-2 conditioning cameras do not match the resolved view plan.")
 
         def skeletons(camera_records: list[dict]) -> tuple[SkeletonVideo, ...]:
             return tuple(
@@ -97,9 +99,10 @@ class Conditioning:
 
         target_skeletons = skeletons(records)
         rcp_skeletons = skeletons(rcp_records)
+        rcp2_skeletons = skeletons(rcp2_records)
         required = (
             root / metadata["source_video"],
-            *(item.path for item in (*target_skeletons, *rcp_skeletons)),
+            *(item.path for item in (*target_skeletons, *rcp_skeletons, *rcp2_skeletons)),
         )
         missing = [str(path) for path in required if not path.is_file()]
         if missing:
@@ -114,6 +117,7 @@ class Conditioning:
             fps_num=int(metadata["fps_num"]),
             fps_den=int(metadata["fps_den"]),
             num_frames=int(metadata["num_frames"]),
+            rcp2_skeletons=rcp2_skeletons,
         )
 
 
@@ -165,105 +169,6 @@ def _safe_regressor_metadata(support_shape: tuple[int, ...]) -> dict[str, int | 
         "num_keypoints": int(support_shape[0]),
         "support_vertices_per_keypoint": int(support_shape[1]),
     }
-
-
-def _load_regressor(path: Path, device):
-    import torch
-
-    data = torch.load(path, map_location="cpu", weights_only=True)
-    support = data["support_vertex_ids"].detach().long().to(device)
-    weights = data["weights"].detach().float().to(device)
-    names = tuple(str(value) for value in data["keypoint_names"])
-    if support.shape != weights.shape or support.shape[0] != 70:
-        raise AssetError(f"Unexpected MHR70 regressor shapes: support={support.shape}, weights={weights.shape}.")
-    if names != KEYPOINT_NAMES:
-        raise AssetError("MHR70 regressor keypoint order does not match the frozen Goliath70 schema.")
-    return support, weights, _safe_regressor_metadata(tuple(support.shape))
-
-
-@contextmanager
-def _gvhmr_geometry_context(gvhmr_root: Path):
-    install_pytorch3d_compat()
-    with gvhmr_imports(gvhmr_root):
-        yield
-
-
-def _body_geometry(
-    motion: MotionResult,
-    regressor_path: Path,
-    gvhmr_root: Path,
-    device: str,
-    *,
-    include_mesh: bool = False,
-) -> _BodyGeometry:
-    import torch
-
-    body_model = gvhmr_root / "inputs/checkpoints/body_models/smplx/SMPLX_NEUTRAL.npz"
-    if not body_model.is_file():
-        raise AssetError(
-            "The licensed SMPL-X body model is missing. Run `python scripts/download_smplx.py`; "
-            f"expected the GVHMR compatibility link at {body_model}."
-        )
-    utility_root = gvhmr_root / "hmr4d/utils/body_model"
-    smplx_to_smpl_path = utility_root / "smplx2smpl_sparse.pt"
-    joint_regressor_path = utility_root / "smpl_neutral_J_regressor.pt"
-    for path in (smplx_to_smpl_path, joint_regressor_path):
-        if not path.is_file():
-            raise AssetError(f"GVHMR body-model utility is missing: {path}")
-
-    torch_device = torch.device(device)
-    support, weights, regressor_metadata = _load_regressor(regressor_path, torch_device)
-    with _gvhmr_geometry_context(gvhmr_root):
-        from hmr4d.utils.geo_transform import apply_T_on_points, compute_T_ayfz2ay
-        from hmr4d.utils.smplx_utils import make_smplx
-
-        smplx = make_smplx("supermotion").to(torch_device).eval()
-        global_parameters = {name: value.to(torch_device) for name, value in motion.smpl_params_global.items()}
-        incam_parameters = {name: value.to(torch_device) for name, value in motion.smpl_params_incam.items()}
-        with torch.inference_mode():
-            vertices_global = smplx(**global_parameters).vertices.detach()
-            vertices_incam = smplx(**incam_parameters).vertices.detach()
-        if tuple(vertices_global.shape[1:]) != (10475, 3) or vertices_incam.shape != vertices_global.shape:
-            raise FourDAnyoneError(
-                "Expected matching global/incam SMPL-X vertices [frames,10475,3], got "
-                f"{tuple(vertices_global.shape)} and {tuple(vertices_incam.shape)}."
-            )
-        keypoints_global = (vertices_global[:, support] * weights[None, :, :, None]).sum(dim=2)
-        keypoints_incam = (vertices_incam[:, support] * weights[None, :, :, None]).sum(dim=2)
-        smplx_to_smpl = torch.load(smplx_to_smpl_path, map_location=torch_device, weights_only=True)
-        joint_regressor = torch.load(joint_regressor_path, map_location=torch_device, weights_only=True)
-        vertices_smpl = torch.stack([torch.matmul(smplx_to_smpl, frame) for frame in vertices_global])
-        offset = torch.einsum("jv,vi->ji", joint_regressor, vertices_smpl[0])[0]
-        offset = offset.clone()
-        offset[1] = vertices_smpl[..., 1].min()
-        vertices_offset = vertices_smpl - offset
-        first_joints = torch.einsum("jv,lvi->lji", joint_regressor, vertices_offset[[0]])
-        transform = compute_T_ayfz2ay(first_joints, inverse=True)
-        vertices_world = apply_T_on_points(vertices_offset, transform)
-        keypoints_world = apply_T_on_points(keypoints_global - offset, transform)
-        joints_world = torch.einsum("jv,lvi->lji", joint_regressor, vertices_world)
-        mesh_world = (
-            apply_T_on_points(vertices_global - offset, transform).detach().cpu().numpy().astype(np.float32)
-            if include_mesh
-            else None
-        )
-        mesh_faces = np.asarray(smplx.faces, dtype=np.uint32) if include_mesh else None
-
-    world_transform = transform[0].detach().clone()
-    world_transform[:3, 3] -= world_transform[:3, :3] @ offset
-    result = _BodyGeometry(
-        vertices_world.detach().cpu().numpy().astype(np.float32),
-        joints_world.detach().cpu().numpy().astype(np.float32),
-        keypoints_world.detach().cpu().numpy().astype(np.float32),
-        keypoints_incam.detach().cpu().numpy().astype(np.float32),
-        world_transform.detach().cpu().numpy().astype(np.float64),
-        regressor_metadata,
-        mesh_world,
-        mesh_faces,
-    )
-    del smplx, vertices_global, vertices_incam, vertices_smpl, vertices_world, keypoints_global, keypoints_world
-    torch.cuda.empty_cache()
-    return result
 
 
 def _front_direction(joints: np.ndarray) -> np.ndarray:
@@ -336,22 +241,27 @@ def build_skeleton_conditioning(
     *,
     motion: MotionResult,
     clip: CanonicalClip,
-    regressor_path: str | Path,
     foreground_model_path: str | Path,
-    gvhmr_root: str | Path,
     output_dir: str | Path,
     device: str,
     view_plan: ViewPlan,
+    geometry: _BodyGeometry,
 ) -> Conditioning:
-    """Build source, RCP, and target conditioning on one camera grid."""
+    """Build source, RCP, and target conditioning on one camera grid.
 
-    gvhmr_root, _ = validate_gvhmr(gvhmr_root)
+    `geometry` carries the body geometry the estimator produced; see
+    `fdanyone.skeleton.sam3d`, which builds it from SAM 3D Body. Everything here is
+    estimator-agnostic and only reads the arrays, which is what made replacing GVHMR and
+    SMPL-X a matter of supplying this one object.
+    """
+
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
 
     LOGGER.info("Estimating source foreground masks with BiRefNet")
     masks = predict_foreground_masks(clip.rgb_frames, foreground_model_path, device)
-    geometry = _body_geometry(motion, Path(regressor_path), gvhmr_root, device)
+    LOGGER.info("Body geometry from %s",
+                geometry.regressor_metadata.get("estimator", "unknown"))
     input_framing = analyze_input_framing(
         geometry.keypoints_incam,
         KEYPOINT_NAMES,
@@ -488,15 +398,20 @@ def build_skeleton_conditioning(
     )
     cropped_target_cameras = tuple(_cropped_camera(camera, target_crop) for camera in raw_target_cameras)
 
-    if not view_plan.enable_rcp:
-        raw_rcp_cameras: tuple[Camera, ...] = ()
-        rcp_paths: tuple[Path, ...] = ()
-        cropped_rcp_cameras: tuple[Camera, ...] = ()
-    elif view_plan.is_canonical_target_ring:
-        raw_rcp_cameras = tuple(raw_target_cameras[camera_id] for camera_id in view_plan.rcp_camera_ids)
-        rcp_paths = tuple(target_paths[camera_id] for camera_id in view_plan.rcp_camera_ids)
-        cropped_rcp_cameras = tuple(cropped_target_cameras[camera_id] for camera_id in view_plan.rcp_camera_ids)
-    else:
+    def _proposal_cameras(
+        camera_ids: tuple[int, ...],
+        subdir: str,
+    ) -> tuple[tuple[Camera, ...], tuple[Path, ...], tuple[Camera, ...]]:
+        """Resolve proposal cameras on the canonical ring the model was trained on."""
+
+        if not camera_ids:
+            return (), (), ()
+        if view_plan.is_canonical_target_ring:
+            return (
+                tuple(raw_target_cameras[camera_id] for camera_id in camera_ids),
+                tuple(target_paths[camera_id] for camera_id in camera_ids),
+                tuple(cropped_target_cameras[camera_id] for camera_id in camera_ids),
+            )
         canonical_cameras = camera_ring(
             center=center,
             front_direction=front_direction,
@@ -507,13 +422,18 @@ def build_skeleton_conditioning(
             target_height=framing.target_height,
             layer_index=-1,
         )
-        raw_rcp_cameras = tuple(canonical_cameras[camera_id] for camera_id in view_plan.rcp_camera_ids)
-        rcp_root = root / "rcp_goliath40"
-        rcp_root.mkdir()
-        rcp_paths = tuple(
-            render_skeleton(camera, rcp_root / f"{camera.camera_id:02d}.mp4") for camera in raw_rcp_cameras
-        )
-        cropped_rcp_cameras = tuple(_cropped_camera(camera, target_crop) for camera in raw_rcp_cameras)
+        raw = tuple(canonical_cameras[camera_id] for camera_id in camera_ids)
+        proposal_root = root / subdir
+        proposal_root.mkdir()
+        paths = tuple(render_skeleton(camera, proposal_root / f"{camera.camera_id:02d}.mp4") for camera in raw)
+        return raw, paths, tuple(_cropped_camera(camera, target_crop) for camera in raw)
+
+    raw_rcp_cameras, rcp_paths, cropped_rcp_cameras = _proposal_cameras(
+        view_plan.rcp_camera_ids, "rcp_goliath40"
+    )
+    raw_rcp2_cameras, rcp2_paths, cropped_rcp2_cameras = _proposal_cameras(
+        view_plan.rcp2_camera_ids, "rcp2_goliath40"
+    )
 
     def camera_records(
         raw_cameras: tuple[Camera, ...],
@@ -543,6 +463,7 @@ def build_skeleton_conditioning(
         "framing": framing_payload,
         "cameras": camera_records(raw_target_cameras, cropped_target_cameras, target_paths),
         "rcp_cameras": camera_records(raw_rcp_cameras, cropped_rcp_cameras, rcp_paths),
+        "rcp2_cameras": camera_records(raw_rcp2_cameras, cropped_rcp2_cameras, rcp2_paths),
     }
     write_json(root / "cameras.json", camera_payload)
     write_json(
@@ -589,4 +510,5 @@ def build_skeleton_conditioning(
         fps_num=clip.fps_num,
         fps_den=clip.fps_den,
         num_frames=motion.num_frames,
+        rcp2_skeletons=tuple(SkeletonVideo(path, target_crop) for path in rcp2_paths),
     )
