@@ -132,7 +132,7 @@ def _merge_lora_factors(state_dict: dict) -> None:
         )
 
 
-def _load_dit(checkpoint_path: Path):
+def _load_dit(checkpoint_path: Path, attention_backend: str):
     import torch
 
     from fdanyone.vendor.diffsynth.models.wan_video_dit import (
@@ -143,7 +143,7 @@ def _load_dit(checkpoint_path: Path):
     )
 
     with torch.device("meta"):
-        dit = FourDAnyoneDiT()
+        dit = FourDAnyoneDiT(attention_backend=attention_backend)
     state_dict, metadata = _load_checkpoint(checkpoint_path, exclude_prefixes=(POSE_ENCODER_PREFIX,))
     _merge_lora_factors(state_dict)
     _strict_assign(dit, state_dict, "4DAnyone DiT checkpoint")
@@ -202,6 +202,7 @@ def load_denoiser(
     checkpoint_path: str | Path,
     turbo_lora_path: str | Path | None,
     profile: DenoisingProfile,
+    attention_backend: str,
 ) -> Denoiser:
     """Load one DiT and configure its denoising trajectory."""
 
@@ -216,7 +217,7 @@ def load_denoiser(
     turbo_path = None if turbo_lora_path is None else Path(turbo_lora_path).expanduser().resolve()
     if turbo_path is not None and not turbo_path.is_file():
         raise AssetError(f"Turbo LoRA does not exist: {turbo_path}")
-    model, metadata = _load_dit(checkpoint)
+    model, metadata = _load_dit(checkpoint, attention_backend)
     if turbo_path is not None:
         from fdanyone.model.turbo_lora import validate_turbo_base_metadata
 

@@ -10,12 +10,13 @@ runtime.
 from __future__ import annotations
 
 import math
-import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
+
+from fdanyone.attention import resolve_attention_backend
 
 try:
     import flash_attn_interface
@@ -54,53 +55,22 @@ RMS_NORM_FP32_TEMPORARY_BUDGET_BYTES = 1536 * 1024**2
 # linear consumes them as BF16. Bound the three coexisting FP32 tensors while
 # preserving that final cast boundary.
 NORM_MODULATION_FP32_TEMPORARY_BUDGET_BYTES = 1536 * 1024**2
-ATTENTION_BACKEND_PRIORITY = ("flash_attn_3", "sageattention", "sdpa")
 
 
-ATTENTION_BACKEND_ENV = "FDANYONE_ATTENTION_BACKEND"
-
-
-def get_attention_backend() -> str:
-    """Return the implementation selected by the release auto policy.
-
-    ``FDANYONE_ATTENTION_BACKEND`` pins one backend instead. The auto policy
-    ranks by speed, but this pipeline is bound by memory rather than by time.
-    Measured on an RTX 5090 (bf16, 24 heads, head_dim 128), sageattn peaks at
-    exactly 2x the memory of torch SDPA -- it holds INT8 copies of q and k plus
-    a smoothed k alongside the originals, whereas SDPA already dispatches to
-    the flash kernel and is O(N). For the multiview-attention shape this model
-    uses::
-
-        v=5 (RCP off)   SDPA +1.57 GiB  36 ms   sage +3.13 GiB  22 ms
-        v=6 (RCP on)    SDPA +1.89 GiB  50 ms   sage +3.75 GiB  31 ms
-
-    So wherever sageattention merely happens to be importable -- a shared
-    ComfyUI environment, say -- the auto policy silently costs ~1.9 GiB at the
-    moment RCP needs it. Set the variable to "sdpa" to opt out.
-    """
+def get_attention_backend(backend: str = "auto") -> str:
+    """Resolve a requested backend against the installed implementations."""
 
     availability = {
         "flash_attn_3": FLASH_ATTN_3_AVAILABLE,
         "sageattention": SAGE_ATTN_AVAILABLE,
         "sdpa": True,
     }
-    override = os.environ.get(ATTENTION_BACKEND_ENV, "").strip().lower()
-    if override:
-        if override not in ATTENTION_BACKEND_PRIORITY:
-            raise ValueError(
-                f"{ATTENTION_BACKEND_ENV} must be one of "
-                f"{', '.join(ATTENTION_BACKEND_PRIORITY)}, got {override!r}."
-            )
-        if not availability[override]:
-            raise ValueError(f"{ATTENTION_BACKEND_ENV}={override!r} but that backend is not importable.")
-        return override
-    return next(backend for backend in ATTENTION_BACKEND_PRIORITY if availability[backend])
+    return resolve_attention_backend(backend, availability)
 
 
-def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int) -> torch.Tensor:
-    """Evaluate attention with the backend selected by the release policy."""
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, backend: str) -> torch.Tensor:
+    """Evaluate attention with the owning model's resolved backend."""
 
-    backend = get_attention_backend()
     if backend == "flash_attn_3":
         q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
@@ -270,9 +240,10 @@ class RMSNorm(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, eps: float = NORM_EPSILON) -> None:
+    def __init__(self, dim: int, num_heads: int, *, attention_backend: str, eps: float = NORM_EPSILON) -> None:
         super().__init__()
         self.num_heads = num_heads
+        self.attention_backend = attention_backend
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
@@ -286,13 +257,14 @@ class SelfAttention(nn.Module):
         v = self.v(x)
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
-        return self.o(attention(q, k, v, self.num_heads))
+        return self.o(attention(q, k, v, self.num_heads, self.attention_backend))
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, eps: float = NORM_EPSILON) -> None:
+    def __init__(self, dim: int, num_heads: int, *, attention_backend: str, eps: float = NORM_EPSILON) -> None:
         super().__init__()
         self.num_heads = num_heads
+        self.attention_backend = attention_backend
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
@@ -304,16 +276,16 @@ class CrossAttention(nn.Module):
         q = self.norm_q.forward_inplace(self.q(x))
         k = self.norm_k.forward_inplace(self.k(context))
         v = self.v(context)
-        return self.o(attention(q, k, v, self.num_heads))
+        return self.o(attention(q, k, v, self.num_heads, self.attention_backend))
 
 
 class DiTBlock(nn.Module):
     """One frozen video + multiview + prompt + FFN transformer block."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, attention_backend: str) -> None:
         super().__init__()
-        self.self_attn = SelfAttention(MODEL_DIM, NUM_HEADS)
-        self.cross_attn = CrossAttention(MODEL_DIM, NUM_HEADS)
+        self.self_attn = SelfAttention(MODEL_DIM, NUM_HEADS, attention_backend=attention_backend)
+        self.cross_attn = CrossAttention(MODEL_DIM, NUM_HEADS, attention_backend=attention_backend)
         self.norm1 = nn.LayerNorm(MODEL_DIM, eps=NORM_EPSILON, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(MODEL_DIM, eps=NORM_EPSILON, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(MODEL_DIM, eps=NORM_EPSILON)
@@ -326,7 +298,7 @@ class DiTBlock(nn.Module):
 
         self.modulation_mvs = nn.Parameter(torch.randn(1, 3, MODEL_DIM) / MODEL_DIM**0.5)
         self.norm1_mvs = nn.LayerNorm(MODEL_DIM, eps=NORM_EPSILON, elementwise_affine=False)
-        self.self_attn_mvs = SelfAttention(MODEL_DIM, NUM_HEADS)
+        self.self_attn_mvs = SelfAttention(MODEL_DIM, NUM_HEADS, attention_backend=attention_backend)
 
     def _feed_forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden = self.ffn[0](x)
@@ -337,6 +309,21 @@ class DiTBlock(nn.Module):
             del x
         hidden = gelu_tanh(hidden)
         return self.ffn[2](hidden)
+
+    @staticmethod
+    def _add_residual(x: torch.Tensor, branch: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
+        """Update the inference-owned token stream after a branch has consumed it.
+
+        Keep multiplication and addition separate, including their BF16 rounding.
+        Reusing the stream also prevents the caller from retaining an obsolete
+        block input while the FFN creates its much larger hidden activation.
+        """
+
+        if torch.is_grad_enabled():
+            return x + (branch if gate is None else gate * branch)
+        if gate is not None:
+            branch.mul_(gate)
+        return x.add_(branch)
 
     def _multiview_attention(
         self,
@@ -378,27 +365,26 @@ class DiTBlock(nn.Module):
             self.modulation.to(dtype=time_modulation.dtype, device=time_modulation.device) + time_modulation
         ).chunk(6, dim=1)
 
-        x = x + gate_msa * self.self_attn(
-            normalized_modulation(self.norm1, x, shift_msa, scale_msa),
-            spatial_freqs,
+        x = self._add_residual(
+            x,
+            self.self_attn(normalized_modulation(self.norm1, x, shift_msa, scale_msa), spatial_freqs),
+            gate_msa,
         )
 
         shift_mvs, scale_mvs, gate_mvs = (
             self.modulation_mvs.to(dtype=time_modulation.dtype, device=time_modulation.device)
             + time_modulation[:, :3, :]
         ).chunk(3, dim=1)
-        x = x + gate_mvs * self._multiview_attention(
+        x = self._add_residual(
             x,
-            shift_mvs,
-            scale_mvs,
-            multiview_freqs,
-            shape,
+            self._multiview_attention(x, shift_mvs, scale_mvs, multiview_freqs, shape),
+            gate_mvs,
         )
 
-        x = x + self.cross_attn(self.norm3(x), repeat(context, "1 l c -> v l c", v=x.shape[0]))
+        x = self._add_residual(x, self.cross_attn(self.norm3(x), repeat(context, "1 l c -> v l c", v=x.shape[0])))
 
         residual = self._feed_forward(normalized_modulation(self.norm2, x, shift_mlp, scale_mlp))
-        return x + gate_mlp * residual
+        return self._add_residual(x, residual, gate_mlp)
 
 
 class Head(nn.Module):
@@ -454,8 +440,9 @@ class ViewPackEmbedding(nn.Module):
 class FourDAnyoneDiT(nn.Module):
     """Exact immutable inference graph for the released model checkpoint."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, attention_backend: str = "auto") -> None:
         super().__init__()
+        self.attention_backend = get_attention_backend(attention_backend)
         self.patch_embedding = nn.Conv3d(
             LATENT_CHANNELS,
             MODEL_DIM,
@@ -473,7 +460,7 @@ class FourDAnyoneDiT(nn.Module):
             nn.Linear(MODEL_DIM, MODEL_DIM),
         )
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(MODEL_DIM, MODEL_DIM * 6))
-        self.blocks = nn.ModuleList(DiTBlock() for _ in range(NUM_LAYERS))
+        self.blocks = nn.ModuleList(DiTBlock(attention_backend=self.attention_backend) for _ in range(NUM_LAYERS))
         self.head = Head()
         self.viewpack_embedding = ViewPackEmbedding()
         self.freqs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] = ()
@@ -570,21 +557,23 @@ class FourDAnyoneDiT(nn.Module):
         return x, packed_views
 
     @staticmethod
-    def _add_target_pose_features_streamed(
+    def _add_pose_bank(
         x: torch.Tensor,
         pose_features: torch.Tensor,
-        target_views: int,
-        grid_size: tuple[int, int, int],
     ) -> None:
-        """Stage one CPU pose feature at a time into patch-token storage."""
+        """Consume a pose bank without keeping it on the GPU during the blocks."""
 
-        frames, height, width = grid_size
+        if pose_features.device == x.device:
+            x.add_(rearrange(pose_features, "v c f h w -> v (f h w) c"))
+            return
+        if pose_features.device.type != "cpu":
+            raise ValueError(f"Inference pose features must be on CPU or {x.device}, got {pose_features.device}.")
         staging = torch.empty(
-            (MODEL_DIM, frames, height, width),
+            pose_features.shape[1:],
             dtype=x.dtype,
             device=x.device,
         )
-        for view_index in range(target_views):
+        for view_index in range(pose_features.shape[0]):
             staging.copy_(pose_features[view_index])
             pose_tokens = rearrange(staging, "c f h w -> (f h w) c")
             x[view_index].add_(pose_tokens)
@@ -605,25 +594,14 @@ class FourDAnyoneDiT(nn.Module):
             raise ValueError(f"Expected pose features {expected_pose}, got {tuple(pose_features.shape)}.")
         if tuple(null_pose_feature.shape) != expected_null:
             raise ValueError(f"Expected null pose features {expected_null}, got {tuple(null_pose_feature.shape)}.")
-        null_tokens = rearrange(null_pose_feature, "v c f h w -> v (f h w) c")
         if torch.is_grad_enabled():
-            if pose_features.device != x.device:
+            if pose_features.device != x.device or null_pose_feature.device != x.device:
                 raise ValueError("Training requires pose features on the same device as patch tokens.")
             pose_tokens = rearrange(pose_features, "v c f h w -> v (f h w) c")
+            null_tokens = rearrange(null_pose_feature, "v c f h w -> v (f h w) c")
             return torch.cat([x[:target_views] + pose_tokens, x[target_views:] + null_tokens], dim=0)
-        if pose_features.device == x.device:
-            pose_tokens = rearrange(pose_features, "v c f h w -> v (f h w) c")
-            x[:target_views].add_(pose_tokens)
-        else:
-            if pose_features.device.type != "cpu":
-                raise ValueError(f"Inference pose features must be on CPU or {x.device}, got {pose_features.device}.")
-            FourDAnyoneDiT._add_target_pose_features_streamed(
-                x,
-                pose_features,
-                target_views,
-                grid_size,
-            )
-        x[target_views:].add_(null_tokens)
+        FourDAnyoneDiT._add_pose_bank(x[:target_views], pose_features)
+        FourDAnyoneDiT._add_pose_bank(x[target_views:], null_pose_feature)
         return x
 
     def forward(

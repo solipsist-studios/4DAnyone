@@ -6,21 +6,20 @@
 
 <p align="center"><img src="docs/assets/teaser.gif" width="100%" alt="4DAnyone teaser"></p>
 
-<p align="center">4DAnyone turns a casual monocular video into multi-view videos, enabling downstream 4DGS reconstruction.</p>
+4DAnyone turns a casual monocular video into consistent multiview videos, enabling downstream 4DGS reconstruction.
 
-> [!note]
-> 4DAnyone is a multi-view video model that:
->
-> - generates dozens of synchronized, view-consistent videos from a single monocular video.
-> - requires **22 GB** of peak CUDA memory, enabling inference on consumer GPUs.
-> - generates a 121-frame video in **27 seconds** on a single RTX 4090.
+- No input camera parameters or static camera required.
+- Supports dozens of output views with flexible camera placement.
 
 ## News
 
+> [!note]
+> We're actively improving 4DAnyone. We recommend using the latest code.
+
+- **2026-09-16**: Released a **GUI** for interactive inference and visualization.
 - **2026-09-05**: Reduced peak GPU memory below **24 GB**, enabling inference on consumer GPUs (RTX 4090).
 - **2026-09-02**: Released **4DAnyone-Turbo**, achieving a **5.58×** denoising speedup over 4DAnyone-Base.
-- **2026-08-28**: Achieved a **1.42×** end-to-end speedup for the complete 24-view generation pipeline.
-- **2026-08-28**: Reduced peak GPU memory below **32 GB** while slightly improving speed.
+- **2026-08-28**: Achieved a **1.42×** end-to-end speedup and reduced peak GPU memory below **32 GB**.
 
 ## Installation
 
@@ -46,9 +45,16 @@ python scripts/download_example.py
 
 ## Inference
 
-This repository provides two models: **4DAnyone-Base** with the standard denoising schedule and the distilled **4DAnyone-Turbo** for faster four-step denoising. 4DAnyone-Turbo is enabled by default for faster inference while maintaining generation quality comparable to 4DAnyone-Base. See [Inference performance](docs/inference_performance.md) for GPU memory, inference speed, and generation quality benchmarks.
+We provide two models: **4DAnyone-Base** with the standard denoising schedule and the distilled **4DAnyone-Turbo** for faster four-step denoising (enabled by default).
 
-4DAnyone supports flexible target-view counts, pitch layers, and yaw coverage. Here are several common camera configurations:
+> [!note]
+> See [Inference performance](docs/inference_performance.md) for GPU memory, inference speed, and generation quality benchmarks.
+>
+> - Peaks at 22 GB of CUDA memory, enabling inference on consumer GPUs.
+> - Averages 27 seconds per 121-frame video on a single RTX 4090.
+> - 4DAnyone-Turbo delivers generation quality comparable to 4DAnyone-Base.
+
+4DAnyone supports flexible target-view counts, pitch layers, and yaw coverage. Run `python inference.py --help` to see all available options. Here are several common camera configurations:
 
 ### 6-View Full Orbit
 
@@ -57,10 +63,11 @@ A compact 360° layout for basic coverage. Start here for an initial test.
 ```bash
 python inference.py \
     --video_path "data/source/pexels/2785536-uhd_2160_3840_25fps.mp4" \
+    --output_dir "data/fdanyone/pexels/2785536-uhd_2160_3840_25fps" \
     --views_per_layer 6
 ```
 
-<p align="left"><img src="docs/assets/inference-6-views.jpg" width="600" alt="Six evenly spaced target cameras on one full orbit"></p>
+<p align="left"><img src="docs/assets/inference-6-views.jpg" width="450" alt="Six evenly spaced target cameras on one full orbit"></p>
 
 ### 24-View Full Orbit
 
@@ -69,10 +76,11 @@ A dense 360° layout with broad angular coverage, suitable for 4DGS reconstructi
 ```bash
 python inference.py \
     --video_path "data/source/pexels/2785536-uhd_2160_3840_25fps.mp4" \
+    --output_dir "data/fdanyone/pexels/2785536-uhd_2160_3840_25fps" \
     --views_per_layer 24
 ```
 
-<p align="left"><img src="docs/assets/inference-24-views.jpg" width="600" alt="Twenty-four evenly spaced target cameras on one full orbit"></p>
+<p align="left"><img src="docs/assets/inference-24-views.jpg" width="450" alt="Twenty-four evenly spaced target cameras on one full orbit"></p>
 
 ### 48-View Full Orbit, Three Pitch Layers
 
@@ -81,10 +89,11 @@ This layout distributes views across three pitch rings for broader coverage, ena
 ```bash
 python inference.py \
     --video_path "data/source/pexels/2785536-uhd_2160_3840_25fps.mp4" \
+    --output_dir "data/fdanyone/pexels/2785536-uhd_2160_3840_25fps" \
     --views_per_layer 16 --layer_pitches '[-10,15,35]'
 ```
 
-<p align="left"><img src="docs/assets/inference-48-views-3-layers.jpg" width="600" alt="Forty-eight target cameras arranged over three pitch layers"></p>
+<p align="left"><img src="docs/assets/inference-48-views-3-layers.jpg" width="450" alt="Forty-eight target cameras arranged over three pitch layers"></p>
 
 ### 24-View Frontal Arc, Two Pitch Layers
 
@@ -93,36 +102,23 @@ A two-layer layout for dense coverage across the frontal 180° arc.
 ```bash
 python inference.py \
     --video_path "data/source/pexels/2785536-uhd_2160_3840_25fps.mp4" \
+    --output_dir "data/fdanyone/pexels/2785536-uhd_2160_3840_25fps" \
     --views_per_layer 12 --layer_pitches '[0,30]' --start_yaw -90 --yaw_span 180
 ```
 
-<p align="left"><img src="docs/assets/inference-24-views-front-180.jpg" width="600" alt="Twenty-four target cameras distributed over two pitch layers along the frontal 180-degree arc"></p>
+<p align="left"><img src="docs/assets/inference-24-views-front-180.jpg" width="450" alt="Twenty-four target cameras distributed over two pitch layers along the frontal 180-degree arc"></p>
 
-### Key Arguments
+### Output Structure
 
-Run `python inference.py --help` for the full list.
-
-- `views_per_layer`: number of evenly spaced views per pitch layer. It must be divisible by 4 or 6.
-- `layer_pitches`: pitch angles in degrees, one per layer. Positive values place cameras above the subject. Total views are `views_per_layer × len(layer_pitches)`.
-- `start_yaw`: horizontal angle of the first view, in degrees. Yaw `0` is the front view.
-- `yaw_span`: horizontal range covered by each camera layer, in degrees.
-- `gpu_ids`: GPU IDs used for parallel pose/VAE view stages and target denoising. Defaults to all visible GPUs.
-- `enable_turbo`: whether to use 4DAnyone-Turbo. Enabled by default.
-
-### Output
-
-With the default `--data_dir data`, results follow this layout. See the [output documentation](docs/output.md) for the complete format.
-
-```text
-data/
-├── gvhmr/results/<clip>/          # reusable motion-recovery result
-└── fdanyone/<clip>/
-    ├── metadata.json              # run settings, timings, resources
-    ├── cameras.json               # the final N-camera rig
-    ├── skeletons/00.mp4 ... <N-1>.mp4
-    └── videos/
-        ├── sparse/{00,04,09,12,14,19}.mp4  # default 24-view RCP proposals
-        └── dense/00.mp4 ... <N-1>.mp4       # generated target views
+```bash
+<clip>/                           # input filename without its extension
+├── metadata.json                 # run settings, timings, resources
+├── cameras.json                  # intrinsics and poses for N target views
+├── gvhmr/                        # reusable motion recovery
+│   ├── motion.json               # source timeline and motion metadata
+│   └── motion.safetensors        # motion tensors
+├── skeletons/00.mp4 ... <N-1>.mp4  # pose conditioning for each target view
+└── videos/00.mp4 ... <N-1>.mp4     # target videos
 ```
 
 ### Custom Data
@@ -133,26 +129,48 @@ Use an input video with:
 - no large camera movements, clear footage.
 - 1080p or higher, 9:16 portrait aspect ratio, at least 121 frames.
 
-## 3DGS Reconstruction
+## GUI
 
-See the [nerfstudio guide](docs/nerfstudio.md) for details.
+We provide a Gradio space for interactive inference and visualization. It is built with [Rerun](https://rerun.io/), inspired by the community [4DAnyone-Rerun Space](https://huggingface.co/spaces/rerun/4danyone-rerun).
 
-## Roadmap
+<p align="center"><img src="docs/assets/space-viewer.gif" width="100%" alt="4DAnyone GUI viewer"></p>
 
-### Peak Memory Optimization
+Install the GUI packages in the `4danyone` environment:
 
-- [x] Reduce peak GPU memory below 32 GB.
-- [x] Further reduce peak GPU memory below 24 GB.
+```bash
+pip install -r requirements-gui.txt
+```
 
-### Inference Acceleration
+Pass an existing output directory to view inference results:
 
-- [x] Optimize inference speed through multi-GPU parallelism.
-- [x] Accelerate inference via few-step model distillation.
+```bash
+python app.py \
+    --output_dir "data/fdanyone/pexels/2785536-uhd_2160_3840_25fps" \
+    --server_port 7860
+```
 
-### Reconstruction
+Choose a source video and a new output directory to run inference:
 
-- [x] Support 3DGS reconstruction with nerfstudio.
-- [ ] Support 4DGS reconstruction with an open-source method.
+```bash
+python app.py \
+    --video_path "data/source/pexels/2785536-uhd_2160_3840_25fps.mp4" \
+    --output_dir "data/fdanyone/pexels/2785536-uhd_2160_3840_25fps" \
+    --server_port 7860
+```
+
+Open http://127.0.0.1:7860 in your browser. For a remote GPU server, first forward the port from your local computer:
+
+```bash
+ssh -N -L 7860:127.0.0.1:7860 user@gpu-host
+```
+
+https://github.com/user-attachments/assets/a51ec078-2970-4a37-9061-104211e1618d
+
+## Reconstruction
+
+For 3DGS reconstruction, see the [nerfstudio guide](docs/nerfstudio.md).
+
+We will integrate an open-source 4DGS reconstruction method. Stay tuned!
 
 ## Citation
 
