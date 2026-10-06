@@ -27,7 +27,6 @@ from fdanyone.config import BASE24, INFERENCE, RANK64_DELTA4
 from fdanyone.device import CUDA_ALLOCATOR_CONF, select_cuda_devices
 from fdanyone.errors import ConfigurationError
 from fdanyone.io import remove_tree, resolve_output_path, write_json
-from fdanyone.motion.result import MotionResult
 from fdanyone.output_directory import OutputDirectory
 from fdanyone.run_request import save_run_request
 from fdanyone.video import (
@@ -401,19 +400,18 @@ def run_pipeline(
                 supplied_npz=Path(sam3d_npz) if sam3d_npz else None,
                 frame_count=len(clip.frames),
             )
-            # Cheap to derive from the pose, so it is rebuilt every run rather than
-            # trusted from a previous one: the pose npz is the reusable artifact.
+            # The pose record the run summary reports, rebuilt every run from the npz (which
+            # is the reusable artifact). It is a minimal record -- fixed 24 fps, placeholder
+            # file identity, empty SMPL dictionaries -- built for the conditioning code, so it
+            # is NOT run through ``validate_against_clip`` or ``save_motion``: those enforce
+            # the GVHMR/SMPL contract and would reject it. The handover is checked instead
+            # (``_accept_supplied_pose``: 70 keypoints, and as many frames as the clip).
             import numpy as _np
 
             from fdanyone.skeleton.sam3d import motion_from_sam
 
             motion = motion_from_sam(_np.load(sam_keypoints), len(clip.frames))
-            motion.validate_against_clip(clip)
             save_run_request(destination, request_options)
-            if output.motion_dir.exists():
-                LOGGER.info("Keeping the motion record already at %s", output.motion_dir)
-            else:
-                output.save_motion(motion)
 
             # Record the published identity only for the published checkpoint; an
             # explicit override must not claim the frozen Hugging Face coordinates.
