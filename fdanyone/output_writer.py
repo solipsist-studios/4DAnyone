@@ -164,8 +164,8 @@ def write_output(
             "height": clip.height,
         },
         "motion": {
-            "method": "GVHMR",
-            "revision": motion.gvhmr_revision,
+            "method": "SAM 3D Body",
+            "world": motion.motion_world,
         },
         "preprocessing": {
             "source_crop_policy": conditioning_metadata["source_crop_policy"],

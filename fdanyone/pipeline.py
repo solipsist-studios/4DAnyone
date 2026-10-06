@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,15 +21,12 @@ from fdanyone.assets import (
     resolve_base_assets,
     resolve_checkpoint,
     resolve_foreground_model,
-    resolve_regressor,
     resolve_turbo_lora,
 )
 from fdanyone.config import BASE24, INFERENCE, RANK64_DELTA4
 from fdanyone.device import CUDA_ALLOCATOR_CONF, select_cuda_devices
-from fdanyone.download import ensure_example_video, ensure_models, ensure_smplx
 from fdanyone.errors import ConfigurationError
 from fdanyone.io import remove_tree, resolve_output_path, write_json
-from fdanyone.motion.gvhmr import validate_gvhmr
 from fdanyone.motion.result import MotionResult
 from fdanyone.output_directory import OutputDirectory
 from fdanyone.run_request import save_run_request
@@ -37,7 +35,7 @@ from fdanyone.video import (
     validate_clip_options,
     validate_required_video_codecs,
     verify_lossless_video,
-    write_gvhmr_video,
+    write_working_video,
 )
 from fdanyone.views import ViewPlan, resolve_view_plan
 
@@ -74,7 +72,7 @@ def _discard_scratch(path: Path) -> None:
 
 
 def _worker_environment() -> dict[str, str]:
-    """Give the short-lived GVHMR workers this checkout and stable CUDA flags."""
+    """Give the short-lived workers this checkout and stable CUDA flags."""
 
     environment = os.environ.copy()
     environment.update(
@@ -88,45 +86,12 @@ def _worker_environment() -> dict[str, str]:
         }
     )
     environment.pop("PYTHONHOME", None)
-    # The 4 GiB split policy is specific to the long-lived DiT process. These
+    # The allocator split policy is specific to the long-lived DiT process; these
     # short-lived preprocessing workers use unrelated allocation shapes.
     environment.pop(CUDA_ALLOCATOR_CONF, None)
     environment["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
     return environment
 
-
-def _run_motion(
-    *,
-    working_video: Path,
-    output_dir: Path,
-    gvhmr_root: Path,
-    device: str,
-    worker_python: str,
-    clip_metadata: Path,
-):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    request_path = output_dir / ".motion-worker-request.json"
-    result_dir = output_dir / "result"
-    write_json(
-        request_path,
-        {
-            "gvhmr_root": str(gvhmr_root),
-            "working_video": str(working_video),
-            "clip_metadata": str(clip_metadata),
-            "output_dir": str(output_dir / "runtime"),
-            "result_dir": str(result_dir),
-            "device": device,
-        },
-    )
-    try:
-        subprocess.run(
-            [worker_python, "-m", "fdanyone.motion.worker", str(request_path)],
-            check=True,
-            env=_worker_environment(),
-        )
-    finally:
-        request_path.unlink(missing_ok=True)
-    return MotionResult.load(result_dir)
 
 
 def _build_conditioning(
@@ -136,11 +101,10 @@ def _build_conditioning(
     motion_result_dir: Path,
     view_plan: ViewPlan,
     output_dir: Path,
-    regressor: Path,
     foreground_model: Path,
-    gvhmr_root: Path,
     device: str,
     worker_python: str,
+    sam_keypoints: Path | None = None,
 ):
     from fdanyone.skeleton.pipeline import Conditioning
 
@@ -151,12 +115,12 @@ def _build_conditioning(
             "working_video": str(working_video),
             "clip_metadata": str(clip_metadata),
             "motion_result_dir": str(motion_result_dir),
-            "regressor_path": str(regressor),
             "foreground_model_path": str(foreground_model),
-            "gvhmr_root": str(gvhmr_root),
             "output_dir": str(output_dir),
             "device": device,
             "view_plan": view_plan.to_dict(),
+            # The tools/sam3d_mhr70.py npz holding this clip's MHR70 body pose.
+            "sam_keypoints": str(sam_keypoints) if sam_keypoints else None,
         },
     )
     try:
@@ -175,14 +139,175 @@ def _build_conditioning(
     return Conditioning.load(output_dir)
 
 
+
+SAM3D_KEYS = ("keypoints_incam", "vertices", "cam_t", "keypoints_2d", "intrinsics",
+              "image_size")
+
+
+def _accept_supplied_pose(supplied: Path, output_npz: Path, frame_count: int) -> Path:
+    """Take a pose npz estimated by our caller and park it in this clip's cache.
+
+    A caller that already has SAM 3D Body loaded, such as the ComfyUI node running inside a
+    ComfyUI that ships the model, can estimate the pose itself and hand it over. That saves
+    a second copy of a 2.83 GB model in a second process, and it is the reason the estimator
+    no longer has to be configured with an interpreter and a checkout.
+
+    The handover is checked rather than trusted: a caller that estimated pose on the wrong
+    frames would misalign the whole conditioning stage silently.
+    """
+    import numpy as np
+
+    if not supplied.is_file():
+        raise ConfigurationError(f"--sam3d_npz does not exist: {supplied}")
+    with np.load(supplied) as data:
+        missing = [key for key in SAM3D_KEYS if key not in data]
+        if missing:
+            raise ConfigurationError(
+                f"--sam3d_npz is missing {', '.join(missing)}: {supplied}")
+        frames = int(data["keypoints_incam"].shape[0])
+        joints = int(data["keypoints_incam"].shape[1])
+    if joints != 70:
+        raise ConfigurationError(
+            f"--sam3d_npz holds {joints} keypoints, expected the 70 of MHR70: {supplied}")
+    if frames != frame_count:
+        raise ConfigurationError(
+            f"--sam3d_npz covers {frames} frames but this clip has {frame_count}. It was "
+            "estimated on different frames, so it cannot be used for this run.")
+    supplied = supplied.resolve()
+    output_npz.parent.mkdir(parents=True, exist_ok=True)
+    if supplied != output_npz.resolve():
+        shutil.copyfile(supplied, output_npz)
+    LOGGER.info("Using SAM 3D Body pose supplied by the caller (%d frames)", frames)
+    return output_npz
+
+
+def _run_sam3d(*, working_video: Path, output_npz: Path, device: str,
+               supplied_npz: Path | None = None, frame_count: int = 0) -> Path:
+    """Estimate MHR70 body pose with SAM 3D Body, replacing the GVHMR motion stage.
+
+    Three ways in, in order of preference: a pose the caller already estimated, a cached one
+    from an earlier run of this clip, or our own run in a ComfyUI interpreter. The cache
+    means re-running a clip with different view settings does not re-estimate pose.
+    """
+    from fdanyone.config import SAM3D
+
+    if supplied_npz is not None:
+        return _accept_supplied_pose(supplied_npz, output_npz, frame_count)
+
+    if output_npz.is_file():
+        LOGGER.info("Reusing SAM 3D Body pose at %s", output_npz)
+        return output_npz
+
+    comfy_root, python = SAM3D.comfy_root, SAM3D.python
+    weights = SAM3D.resolved_weights()
+    missing = [name for name, value in (("FDANYONE_SAM3D_COMFY_ROOT", comfy_root),
+                                        ("FDANYONE_SAM3D_PYTHON", python)) if not value]
+    if missing:
+        raise ConfigurationError(
+            "SAM 3D Body is not configured. Set " + " and ".join(missing) + ". "
+            "The model ships inside ComfyUI, so these point at a ComfyUI checkout and its "
+            "interpreter; weights default to models/detection/ inside that checkout and can "
+            "be overridden with FDANYONE_SAM3D_WEIGHTS. A caller that has the model loaded "
+            "already can skip all of this by passing --sam3d_npz instead."
+        )
+    for label, value in (("interpreter", python), ("weights", weights)):
+        if not Path(value).is_file():
+            raise ConfigurationError(f"SAM 3D Body {label} not found: {value}")
+
+    script = Path(__file__).resolve().parent.parent / "tools" / "sam3d_mhr70.py"
+    output_npz.parent.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("Estimating body pose with SAM 3D Body")
+    subprocess.run(
+        [python, str(script), str(working_video), str(output_npz),
+         "--comfy-root", comfy_root, "--weights", weights,
+         "--batch-size", str(SAM3D.batch_size), "--fov", str(SAM3D.fov_degrees)],
+        check=True,
+    )
+    if not output_npz.is_file():
+        raise ConfigurationError(f"SAM 3D Body produced no output at {output_npz}")
+    return output_npz
+
+
+def prepare_clip_only(
+    *,
+    video_path: str,
+    output_dir: str,
+    start_time: float,
+    target_fps: str | int | float,
+    pad_short: bool = False,
+) -> dict:
+    """Decode this clip's canonical frames into ``output_dir``, then stop.
+
+    The pose stage does not run on the source file but on the canonical clip: the frames
+    selected by start_time, the target frame rate and the 121-frame contract. A caller that
+    wants to estimate pose itself therefore needs that exact clip, which used to exist only
+    inside a scratch directory for the length of a run.
+
+    Everything here is cheap: a decode and a lossless re-encode, no models and no GPU. A
+    clip already in ``output_dir`` is reused only when it matches the source file's identity
+    *and* the requested start time and frame rate, so neither a re-encode of the input nor a
+    changed window can be served a stale clip. This does not publish a 4DAnyone result, so it
+    does not use the locked output protocol.
+    """
+    import json
+    from fractions import Fraction
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    out = Path(output_dir).expanduser()
+    clip_video = out / "canonical_clip.mp4"
+    clip_metadata = out / "canonical_clip.json"
+
+    canonical_fps = None if str(target_fps).lower() == "auto" else target_fps
+    if clip_video.is_file() and clip_metadata.is_file():
+        source = Path(video_path).expanduser().resolve()
+        try:
+            cached = json.loads(clip_metadata.read_text())
+            stat = source.stat()
+            same_start = abs(
+                float(Fraction(cached["start_time_num"], cached["start_time_den"])) - float(start_time)
+            ) < 1e-6
+            same_rate = canonical_fps is None or abs(
+                float(Fraction(cached["fps_num"], cached["fps_den"])) - float(Fraction(str(canonical_fps)))
+            ) < 1e-6
+            fresh = (
+                cached.get("source_path") == source.name
+                and cached.get("source_size_bytes") == stat.st_size
+                and cached.get("source_mtime_ns") == stat.st_mtime_ns
+                and cached.get("num_frames") == INFERENCE.num_frames
+                and same_start
+                and same_rate
+            )
+        except (OSError, ValueError, KeyError, ZeroDivisionError):
+            fresh = False
+        if fresh:
+            LOGGER.info("Reusing canonical clip at %s", clip_video)
+            return {"working_video": str(clip_video), "clip_metadata": str(clip_metadata),
+                    "num_frames": int(cached["num_frames"]), "reused": True}
+
+    validate_required_video_codecs()
+    if not Path(video_path).is_file():
+        raise ConfigurationError(f"Input video does not exist: {video_path}")
+    clip = decode_canonical_clip(
+        video_path,
+        num_frames=INFERENCE.num_frames,
+        start_time=start_time,
+        fps=canonical_fps,
+        pad_short=pad_short,
+    )
+    out.mkdir(parents=True, exist_ok=True)
+    clip.write_metadata(clip_metadata)
+    write_working_video(clip, clip_video)
+    LOGGER.info("Canonical clip written to %s (%d frames)", clip_video, len(clip.frames))
+    return {"working_video": str(clip_video), "clip_metadata": str(clip_metadata),
+            "num_frames": len(clip.frames), "reused": False}
+
+
 def run_pipeline(
     *,
     video_path: str,
     output_dir: str | None,
     model_dir: str,
     checkpoint_path: str | None,
-    mhr70_regressor_path: str | None,
-    gvhmr_root: str,
     gpu_ids: list[int] | None,
     attention_backend: str,
     start_time: float,
@@ -195,8 +320,14 @@ def run_pipeline(
     enable_rcp: bool,
     enable_tcr: bool,
     enable_turbo: bool,
+    sam3d_npz: str | None = None,
+    pad_short: bool = False,
+    vae_path: str | None = None,
+    prompt_context_path: str | None = None,
+    foreground_model_dir: str | None = None,
+    turbo_lora_path: str | None = None,
 ) -> dict:
-    """Execute inference for one clip, retaining reusable motion."""
+    """Execute inference for one clip. Body pose comes from SAM 3D Body (``sam3d_npz``)."""
 
     request_options = locals().copy()
     pipeline_started = time.monotonic()
@@ -237,58 +368,50 @@ def run_pipeline(
     LOGGER.info("Using attention backend: %s", attention_backend)
 
     PROGRESS.info("Preparing model assets", extra={"fraction": 0.05})
-    ensure_example_video(video_path)
-    # Resolve the licensed body model before starting the much larger public
-    # model download. Interactive use continues automatically after setup;
-    # background jobs receive an actionable error instead of hanging.
-    ensure_smplx(model_dir, gvhmr_root)
-    ensure_models(model_dir, gvhmr_root)
-    turbo_lora = resolve_turbo_lora(model_dir) if enable_turbo else None
-    gvhmr_root, gvhmr_revision = validate_gvhmr(gvhmr_root)
+    if not Path(video_path).is_file():
+        raise ConfigurationError(f"Input video does not exist: {video_path}")
+    turbo_lora = resolve_turbo_lora(model_dir, path=turbo_lora_path) if enable_turbo else None
     worker_python = os.path.abspath(sys.executable)
 
     if checkpoint is None:
         checkpoint = resolve_checkpoint(model_dir=model_dir)
-    base_assets = resolve_base_assets(model_dir)
-    regressor = resolve_regressor(mhr70_regressor_path, model_dir=model_dir)
-    foreground_model = resolve_foreground_model(model_dir)
+    base_assets = resolve_base_assets(model_dir, vae_path=vae_path, prompt_context_path=prompt_context_path)
+    foreground_model = resolve_foreground_model(model_dir, path=foreground_model_dir)
     PROGRESS.info("Preparing the 121-frame clip", extra={"fraction": 0.10})
     clip = decode_canonical_clip(
         video_path,
         num_frames=INFERENCE.num_frames,
         start_time=start_time,
         fps=canonical_fps,
+        pad_short=pad_short,
     )
     destination.parent.mkdir(parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(prefix=f".{clip_name}.scratch-", dir=destination.parent))
     try:
         clip_metadata = scratch / "canonical_clip.json"
         clip.write_metadata(clip_metadata)
-        working_video = write_gvhmr_video(clip, scratch / "canonical_clip.mp4")
+        working_video = write_working_video(clip, scratch / "canonical_clip.mp4")
 
         with output.stage() as work:
-            PROGRESS.info("Recovering human motion with GVHMR", extra={"fraction": 0.15})
-            if output.motion_dir.exists():
-                LOGGER.info("Reusing GVHMR motion from %s", output.motion_dir)
-                motion = MotionResult.load(output.motion_dir)
-            else:
-                save_run_request(destination, request_options)
-                motion = _run_motion(
-                    working_video=working_video,
-                    output_dir=scratch / "gvhmr",
-                    gvhmr_root=gvhmr_root,
-                    device=device,
-                    worker_python=worker_python,
-                    clip_metadata=clip_metadata,
-                )
-            if motion.gvhmr_revision != gvhmr_revision:
-                raise ConfigurationError(
-                    f"GVHMR motion has revision {motion.gvhmr_revision}, expected {gvhmr_revision}. "
-                    "Choose a new --output_dir to recover motion with the current GVHMR version."
-                )
+            PROGRESS.info("Reading SAM 3D Body pose", extra={"fraction": 0.15})
+            sam_keypoints = _run_sam3d(
+                working_video=working_video,
+                output_npz=scratch / "sam3d_mhr70.npz",
+                device=device,
+                supplied_npz=Path(sam3d_npz) if sam3d_npz else None,
+                frame_count=len(clip.frames),
+            )
+            # Cheap to derive from the pose, so it is rebuilt every run rather than
+            # trusted from a previous one: the pose npz is the reusable artifact.
+            import numpy as _np
+
+            from fdanyone.skeleton.sam3d import motion_from_sam
+
+            motion = motion_from_sam(_np.load(sam_keypoints), len(clip.frames))
             motion.validate_against_clip(clip)
+            save_run_request(destination, request_options)
             if output.motion_dir.exists():
-                save_run_request(destination, request_options)
+                LOGGER.info("Keeping the motion record already at %s", output.motion_dir)
             else:
                 output.save_motion(motion)
 
@@ -317,11 +440,10 @@ def run_pipeline(
                 motion_result_dir=output.motion_dir,
                 view_plan=view_plan,
                 output_dir=scratch / "conditioning",
-                regressor=regressor,
                 foreground_model=foreground_model,
-                gvhmr_root=gvhmr_root,
                 device=device,
                 worker_python=worker_python,
+                sam_keypoints=sam_keypoints,
             )
             if conditioning.num_frames != len(clip.frames) or (
                 conditioning.fps_num,

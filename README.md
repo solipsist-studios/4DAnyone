@@ -24,9 +24,8 @@
 ## Installation
 
 ```bash
-git clone https://github.com/ant-research/4DAnyone.git
+git clone https://github.com/solipsist-studios/4DAnyone.git
 cd 4DAnyone
-git submodule update --init third_party/GVHMR
 
 conda create -n 4danyone python=3.11 -y
 conda activate 4danyone
@@ -35,10 +34,17 @@ pip install -r requirements.txt
 
 For faster inference, optionally install [FlashAttention-3](https://github.com/Dao-AILab/flash-attention/tree/main/hopper) or [SageAttention](https://github.com/thu-ml/SageAttention). The installed backend is enabled automatically.
 
-Missing models and examples are downloaded automatically on first use. You can also download them manually:
+> [!important]
+> **This fork replaces GVHMR and SMPL-X with SAM 3D Body.** Body pose is no longer estimated
+> inside this repository: estimate it with SAM 3D Body (for example inside ComfyUI, which ships
+> the model) and pass it with `--sam3d_npz`. `--prepare_only=True --output_dir=<dir>` writes the
+> exact canonical clip the pose must be estimated on. The Gradio GUI (`app.py`) is not available.
+> `--enable_turbo=True` (the default) uses a CC BY-NC-SA adapter; set it to `False` for commercial
+> use. See [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md).
+
+Models are not downloaded during inference. Download them with:
 
 ```bash
-python scripts/download_smplx.py
 python scripts/download_model.py
 python scripts/download_example.py
 ```
