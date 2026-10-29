@@ -125,7 +125,7 @@ def smooth(points: np.ndarray, window: int = 9, order: int = 2) -> np.ndarray:
 
 
 def _front(keypoints_frame: np.ndarray) -> np.ndarray:
-    """Facing direction in the xz plane, matching `pipeline._front_direction`."""
+    """Facing direction in the xz plane: left hip/shoulder minus right, turned a quarter."""
     left = ((keypoints_frame[LEFT_HIP, [0, 2]] - keypoints_frame[RIGHT_HIP, [0, 2]])
             + (keypoints_frame[LEFT_SHOULDER, [0, 2]] - keypoints_frame[RIGHT_SHOULDER, [0, 2]]))
     norm = float(np.linalg.norm(left))
@@ -218,46 +218,22 @@ def canonicalise(keypoints_incam: np.ndarray, vertices_incam: np.ndarray | None 
     )
 
 
-# Indices the pipeline's `_front_direction` reads out of a SMPL joint array.
-_SMPL_LEFT_HIP, _SMPL_RIGHT_HIP = 1, 2
-_SMPL_LEFT_SHOULDER, _SMPL_RIGHT_SHOULDER = 16, 17
-
-
 def to_body_geometry(geometry: SamGeometry):
-    """Adapt to `pipeline._BodyGeometry`, so the swap is one line at the call site.
+    """Adapt to `pipeline._BodyGeometry`.
 
-    Two fields need explaining.
-
-    `joints_world` exists in the current path as SMPL's 24 joints, and the pipeline reads
-    exactly four of them, in `_front_direction`: hips at 1 and 2, shoulders at 16 and 17.
-    MHR has no SMPL joint array, so this builds a 24-slot array carrying the equivalent
-    MHR70 landmarks at those four indices. Every other slot is the pelvis, which is inert
-    because nothing reads it. That is a shim, and it is deliberately narrow: the honest fix
-    is for the pipeline to take a front direction rather than derive one from SMPL indices,
-    and `SamGeometry.front_direction` already provides it.
-
-    `vertices_world` is the MHR mesh rather than SMPL's, so its vertex count differs. The
-    pipeline only ever takes its per-frame mean, as a camera target, so the count does not
-    matter. If a future caller indexes it by SMPL vertex id, this will be wrong, loudly.
+    `vertices_world` is the MHR mesh. The pipeline only takes its per-frame mean, as a camera
+    target, so the vertex count does not matter; without a mesh the keypoints stand in.
     """
     from fdanyone.skeleton.pipeline import _BodyGeometry
 
     keypoints = geometry.keypoints_world
-    frames = len(keypoints)
-    pelvis = (keypoints[:, LEFT_HIP] + keypoints[:, RIGHT_HIP]) / 2.0
-    joints = np.repeat(pelvis[:, None, :], 24, axis=1).astype(np.float32)
-    joints[:, _SMPL_LEFT_HIP] = keypoints[:, LEFT_HIP]
-    joints[:, _SMPL_RIGHT_HIP] = keypoints[:, RIGHT_HIP]
-    joints[:, _SMPL_LEFT_SHOULDER] = keypoints[:, LEFT_SHOULDER]
-    joints[:, _SMPL_RIGHT_SHOULDER] = keypoints[:, RIGHT_SHOULDER]
-
     vertices = geometry.vertices_world
     if vertices is None:
-        vertices = keypoints.copy()
+        vertices = keypoints
 
     return _BodyGeometry(
         vertices.astype(np.float32),
-        joints,
+        geometry.front_direction.astype(np.float64),
         keypoints.astype(np.float32),
         geometry.keypoints_incam.astype(np.float32),
         geometry.world_transform.astype(np.float64),
@@ -309,8 +285,6 @@ def motion_from_sam(data, clip_frames: int, fps=None):
     The pipeline reads five things from it: the intrinsics, the 2D detections, the frame
     count, the world-convention string, and the image size. All five exist here.
 
-    The SMPL parameter dictionaries stay empty on purpose: reaching for them on this path
-    is a bug, and an empty dict says so immediately.
     """
     from fractions import Fraction
 
@@ -332,9 +306,8 @@ def motion_from_sam(data, clip_frames: int, fps=None):
         source_mtime_ns=1,
         image_height=height,
         image_width=width,
-        smpl_params_global={},
-        smpl_params_incam={},
-        K_fullimg=torch.as_tensor(np.asarray(data["intrinsics"], dtype=np.float32)),
+        K_fullimg=torch.as_tensor(np.broadcast_to(
+            np.asarray(data["intrinsics"], dtype=np.float32), (frames, 3, 3)).copy()),
         observed_keypoints_2d=torch.as_tensor(detections.astype(np.float32)),
         motion_world="sam3d_gravity_aligned_y_up",
     )

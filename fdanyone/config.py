@@ -191,31 +191,19 @@ def _env_str(name: str, default: str = "") -> str:
 
 @dataclass(frozen=True)
 class Sam3dConfig:
-    """Where to find SAM 3D Body, which replaces GVHMR and SMPL-X.
+    """Where standalone inference runs SAM 3D Body (``python -m fdanyone.pose``).
 
-    The model ships inside ComfyUI rather than as a package, and it needs that checkout's
-    own interpreter, so these are paths rather than imports. It is the same shape as the
-    existing worker-subprocess arrangement: a separate environment, invoked by path.
-
-    All three are environment-overridable because they are machine-specific. A missing or
-    wrong path fails at the start of a run with a message naming the variable, not halfway
-    through.
+    The model ships inside ComfyUI and needs that checkout's interpreter, so these are paths
+    rather than imports. Unused when a caller supplies ``--sam3d_npz``, as comfyui-cumuli
+    does. ``weights`` defaults to the file ``scripts/download_model.py`` fetches.
     """
 
     comfy_root: str = _env_str("FDANYONE_SAM3D_COMFY_ROOT")
     python: str = _env_str("FDANYONE_SAM3D_PYTHON")
     weights: str = _env_str("FDANYONE_SAM3D_WEIGHTS")
     smooth_window: int = _env_int("FDANYONE_SAM3D_SMOOTH", 9)
-    batch_size: int = _env_int("FDANYONE_SAM3D_BATCH", 16)
+    batch_size: int = _env_int("FDANYONE_SAM3D_BATCH", 8)
     fov_degrees: float = _env_float("FDANYONE_SAM3D_FOV", 0.0)
-
-    def resolved_weights(self) -> str:
-        if self.weights:
-            return self.weights
-        if self.comfy_root:
-            return str(_os.path.join(self.comfy_root, "models", "detection",
-                                     "sam_3d_body_dinov3_bf16.safetensors"))
-        return ""
 
 
 SAM3D = Sam3dConfig()

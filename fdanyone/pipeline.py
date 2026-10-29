@@ -180,14 +180,16 @@ def _accept_supplied_pose(supplied: Path, output_npz: Path, frame_count: int) ->
     return output_npz
 
 
-def _run_sam3d(*, working_video: Path, output_npz: Path, device: str,
+def _run_sam3d(*, working_video: Path, output_npz: Path, model_dir: str | Path,
                supplied_npz: Path | None = None, frame_count: int = 0) -> Path:
     """Estimate MHR70 body pose with SAM 3D Body, replacing the GVHMR motion stage.
 
     Three ways in, in order of preference: a pose the caller already estimated, a cached one
-    from an earlier run of this clip, or our own run in a ComfyUI interpreter. The cache
-    means re-running a clip with different view settings does not re-estimate pose.
+    from an earlier run of this clip, or ``fdanyone.pose`` run in a ComfyUI interpreter (the
+    same ``estimate_pose`` the comfyui-cumuli nodes call in-process). The cache means
+    re-running a clip with different view settings does not re-estimate pose.
     """
+    from fdanyone.assets import resolve_sam3d_weights
     from fdanyone.config import SAM3D
 
     if supplied_npz is not None:
@@ -198,29 +200,26 @@ def _run_sam3d(*, working_video: Path, output_npz: Path, device: str,
         return output_npz
 
     comfy_root, python = SAM3D.comfy_root, SAM3D.python
-    weights = SAM3D.resolved_weights()
     missing = [name for name, value in (("FDANYONE_SAM3D_COMFY_ROOT", comfy_root),
                                         ("FDANYONE_SAM3D_PYTHON", python)) if not value]
     if missing:
         raise ConfigurationError(
             "SAM 3D Body is not configured. Set " + " and ".join(missing) + ". "
-            "The model ships inside ComfyUI, so these point at a ComfyUI checkout and its "
-            "interpreter; weights default to models/detection/ inside that checkout and can "
-            "be overridden with FDANYONE_SAM3D_WEIGHTS. A caller that has the model loaded "
-            "already can skip all of this by passing --sam3d_npz instead."
+            "The model runs in ComfyUI's interpreter, so these point at a ComfyUI checkout and "
+            "its python. A caller that already has a pose can skip this by passing --sam3d_npz."
         )
-    for label, value in (("interpreter", python), ("weights", weights)):
-        if not Path(value).is_file():
-            raise ConfigurationError(f"SAM 3D Body {label} not found: {value}")
+    weights = SAM3D.weights or str(resolve_sam3d_weights(model_dir))
+    if not Path(python).is_file():
+        raise ConfigurationError(f"SAM 3D Body interpreter not found: {python}")
 
-    script = Path(__file__).resolve().parent.parent / "tools" / "sam3d_mhr70.py"
     output_npz.parent.mkdir(parents=True, exist_ok=True)
     LOGGER.info("Estimating body pose with SAM 3D Body")
     subprocess.run(
-        [python, str(script), str(working_video), str(output_npz),
+        [python, "-m", "fdanyone.pose", str(working_video), str(output_npz),
          "--comfy-root", comfy_root, "--weights", weights,
          "--batch-size", str(SAM3D.batch_size), "--fov", str(SAM3D.fov_degrees)],
         check=True,
+        cwd=Path(__file__).resolve().parent.parent,
     )
     if not output_npz.is_file():
         raise ConfigurationError(f"SAM 3D Body produced no output at {output_npz}")
@@ -396,16 +395,15 @@ def run_pipeline(
             sam_keypoints = _run_sam3d(
                 working_video=working_video,
                 output_npz=scratch / "sam3d_mhr70.npz",
-                device=device,
+                model_dir=model_dir,
                 supplied_npz=Path(sam3d_npz) if sam3d_npz else None,
                 frame_count=len(clip.frames),
             )
             # The pose record the run summary reports, rebuilt every run from the npz (which
-            # is the reusable artifact). It is a minimal record -- fixed 24 fps, placeholder
-            # file identity, empty SMPL dictionaries -- built for the conditioning code, so it
-            # is NOT run through ``validate_against_clip`` or ``save_motion``: those enforce
-            # the GVHMR/SMPL contract and would reject it. The handover is checked instead
-            # (``_accept_supplied_pose``: 70 keypoints, and as many frames as the clip).
+            # is the reusable artifact). Its source identity is a placeholder and its fps is
+            # fixed, so it is not run through ``validate_against_clip`` or ``save_motion``; the
+            # handover is checked in ``_accept_supplied_pose`` instead (70 keypoints, and as
+            # many frames as the clip).
             import numpy as _np
 
             from fdanyone.skeleton.sam3d import motion_from_sam

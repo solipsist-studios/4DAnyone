@@ -42,12 +42,13 @@ For faster inference, optionally install [FlashAttention-3](https://github.com/D
 > `--enable_turbo=True` (the default) uses a CC BY-NC-SA adapter; set it to `False` for commercial
 > use. See [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md).
 
-Models are not downloaded during inference. Download them with:
+Models are not downloaded during inference. One command fetches everything it needs, including the SAM 3D Body weights (2.8 GB, under Meta's SAM License):
 
 ```bash
 python scripts/download_model.py
-python scripts/download_example.py
 ```
+
+The example clips are optional: `python scripts/download_example.py`.
 
 ## Inference
 

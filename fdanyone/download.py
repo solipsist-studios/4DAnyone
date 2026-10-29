@@ -22,6 +22,10 @@ from fdanyone.assets import (
     HF_REVISION,
     MODEL_FILES,
     PERCEPTUAL_VGG19,
+    SAM3D_DIR,
+    SAM3D_REPO_ID,
+    SAM3D_REVISION,
+    SAM3D_WEIGHTS,
     TURBO_LORA,
     resolve_perceptual_vgg19,
 )
@@ -91,8 +95,17 @@ def ensure_foreground_model(model_dir: str | Path = "models") -> Path:
     return root
 
 
+def ensure_sam3d_weights(model_dir: str | Path = "models") -> Path:
+    root = Path(model_dir).expanduser().resolve() / SAM3D_DIR
+    destination = root / SAM3D_WEIGHTS
+    if not destination.is_file() or destination.stat().st_size == 0:
+        LOGGER.info("Downloading SAM 3D Body weights -> %s", destination)
+        _snapshot([SAM3D_WEIGHTS], root, repo_id=SAM3D_REPO_ID, revision=SAM3D_REVISION)
+    return destination
+
+
 def ensure_models(model_dir: str | Path = "models", *, enable_turbo: bool = True,
-                  checkpoint_path: str | Path | None = None) -> Path:
+                  checkpoint_path: str | Path | None = None, include_sam3d: bool = True) -> Path:
     """Download any missing published model file."""
 
     models = Path(model_dir).expanduser().resolve()
@@ -113,6 +126,8 @@ def ensure_models(model_dir: str | Path = "models", *, enable_turbo: bool = True
                                          filename="4danyone/" + name,
                                          local_dir=str(models))
     ensure_foreground_model(models)
+    if include_sam3d:
+        ensure_sam3d_weights(models)
     return models
 
 
@@ -135,6 +150,7 @@ def download_model(model_dir: str = "models") -> dict[str, str]:
         "models": str(models),
         "revision": HF_REVISION,
         "foreground_revision": BIREFNET_REVISION,
+        "sam3d_revision": SAM3D_REVISION,
     }
 
 

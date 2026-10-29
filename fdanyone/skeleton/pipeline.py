@@ -124,7 +124,7 @@ class Conditioning:
 @dataclass(frozen=True)
 class _BodyGeometry:
     vertices_world: np.ndarray
-    joints_world: np.ndarray
+    front_direction: np.ndarray
     keypoints_world: np.ndarray
     keypoints_incam: np.ndarray
     motion_world_to_canonical_world: np.ndarray
@@ -169,16 +169,6 @@ def _safe_regressor_metadata(support_shape: tuple[int, ...]) -> dict[str, int | 
         "num_keypoints": int(support_shape[0]),
         "support_vertices_per_keypoint": int(support_shape[1]),
     }
-
-
-def _front_direction(joints: np.ndarray) -> np.ndarray:
-    first = joints[0]
-    left = first[1, [0, 2]] - first[2, [0, 2]] + first[16, [0, 2]] - first[17, [0, 2]]
-    norm = float(np.linalg.norm(left))
-    if norm <= 1e-8:
-        return np.array([0.0, 0.0, -1.0], dtype=np.float64)
-    left /= norm
-    return np.array([left[1], 0.0, -left[0]], dtype=np.float64)
 
 
 def _projection_shape(height: int, width: int, max_render_height: int = 1280) -> tuple[int, int]:
@@ -273,7 +263,7 @@ def build_skeleton_conditioning(
     targets = geometry.vertices_world.mean(axis=1)
     targets[:, 1] = 0.0
     center = targets.mean(axis=0)
-    front_direction = _front_direction(geometry.joints_world)
+    front_direction = geometry.front_direction
     reference_K = reference_intrinsics(clip.height, clip.width)
     framing_pitches = tuple(dict.fromkeys((*view_plan.layer_pitches, int(CAMERA.pitch_degrees))))
 

@@ -26,6 +26,13 @@ BIREFNET_FILES = (
     "model.safetensors",
 )
 
+# SAM 3D Body pose weights (Meta's SAM License). Stored under models/sam3d/ with the
+# repository's own detection/ prefix, which is also the folder ComfyUI reads them from.
+SAM3D_REPO_ID = "Comfy-Org/sam-3d-body"
+SAM3D_REVISION = "7c974aea58e062252a6cb5b6f9b7f639d545b729"
+SAM3D_DIR = "sam3d"
+SAM3D_WEIGHTS = "detection/sam_3d_body_dinov3_bf16.safetensors"
+
 CHECKPOINT = "model.safetensors"
 WAN_VAE = "Wan2.2_VAE.pth"
 PROMPT_CONTEXT = "prompt_context.safetensors"
@@ -112,6 +119,16 @@ def resolve_foreground_model(model_dir: str | Path = "models", *, path: str | Pa
     for relative in BIREFNET_FILES:
         _require_file(root / relative, "BiRefNet file", "scripts/download_model.py")
     return root.resolve()
+
+
+def resolve_sam3d_weights(model_dir: str | Path = "models") -> Path:
+    """Resolve the SAM 3D Body weights downloaded by ``scripts/download_model.py``."""
+
+    return _require_file(
+        Path(model_dir) / SAM3D_DIR / SAM3D_WEIGHTS,
+        "SAM 3D Body weights",
+        "scripts/download_model.py",
+    )
 
 
 def resolve_perceptual_vgg19(model_dir: str | Path = "models") -> Path:

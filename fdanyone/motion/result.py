@@ -1,8 +1,6 @@
 """Per-clip body-pose result: timing, intrinsics and 2D detections.
 
-Named for the motion stage it came from. That stage was GVHMR; it is now SAM 3D Body, and
-the SMPL parameter dictionaries it used to carry are unused, kept only so an old on-disk
-result still loads.
+Named for the motion stage it came from. That stage was GVHMR; it is now SAM 3D Body.
 """
 
 from __future__ import annotations
@@ -15,9 +13,6 @@ from typing import Any
 
 from fdanyone.errors import FourDAnyoneError
 
-SMPL_PARAMETER_NAMES = ("body_pose", "betas", "global_orient", "transl")
-SMPL_PARAMETER_WIDTHS = {"body_pose": 63, "betas": 10, "global_orient": 3, "transl": 3}
-
 
 @dataclass(frozen=True)
 class MotionResult:
@@ -29,8 +24,6 @@ class MotionResult:
     source_mtime_ns: int
     image_height: int
     image_width: int
-    smpl_params_global: dict[str, Any]
-    smpl_params_incam: dict[str, Any]
     K_fullimg: Any
     observed_keypoints_2d: Any
     motion_world: str = "sam3d_gravity_aligned_y_up"
@@ -72,20 +65,6 @@ class MotionResult:
             raise FourDAnyoneError("MotionResult has an invalid source-file identity.")
         if self.image_height <= 0 or self.image_width <= 0:
             raise FourDAnyoneError("MotionResult image dimensions must be positive.")
-        for group_name, parameters in (
-            ("smpl_params_global", self.smpl_params_global),
-            ("smpl_params_incam", self.smpl_params_incam),
-        ):
-            if set(parameters) != set(SMPL_PARAMETER_NAMES):
-                raise FourDAnyoneError(
-                    f"MotionResult {group_name} must contain {SMPL_PARAMETER_NAMES}, got {tuple(parameters)}."
-                )
-            for name, tensor in parameters.items():
-                expected_shape = (self.num_frames, SMPL_PARAMETER_WIDTHS[name])
-                if not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != expected_shape:
-                    raise FourDAnyoneError(f"{group_name}.{name} must have shape {expected_shape}.")
-                if not bool(torch.isfinite(tensor).all()):
-                    raise FourDAnyoneError(f"{group_name}.{name} contains non-finite values.")
         if not isinstance(self.K_fullimg, torch.Tensor) or tuple(self.K_fullimg.shape) != (self.num_frames, 3, 3):
             raise FourDAnyoneError(f"K_fullimg must have shape ({self.num_frames}, 3, 3).")
         if not bool(torch.isfinite(self.K_fullimg).all()):
@@ -126,14 +105,6 @@ class MotionResult:
         root.mkdir(parents=True, exist_ok=True)
         tensor_path = root / "motion.safetensors"
         tensors = {
-            **{
-                f"smpl_params_global.{name}": self.smpl_params_global[name].detach().cpu().contiguous()
-                for name in SMPL_PARAMETER_NAMES
-            },
-            **{
-                f"smpl_params_incam.{name}": self.smpl_params_incam[name].detach().cpu().contiguous()
-                for name in SMPL_PARAMETER_NAMES
-            },
             "K_fullimg": self.K_fullimg.detach().cpu().contiguous(),
             "observed_keypoints_2d": self.observed_keypoints_2d.detach().cpu().contiguous(),
         }
@@ -179,8 +150,6 @@ class MotionResult:
             source_mtime_ns=int(metadata["source_mtime_ns"]),
             image_height=int(metadata["image_height"]),
             image_width=int(metadata["image_width"]),
-            smpl_params_global={name: owned[f"smpl_params_global.{name}"] for name in SMPL_PARAMETER_NAMES},
-            smpl_params_incam={name: owned[f"smpl_params_incam.{name}"] for name in SMPL_PARAMETER_NAMES},
             K_fullimg=owned["K_fullimg"],
             observed_keypoints_2d=owned["observed_keypoints_2d"],
             motion_world=str(metadata["motion_world"]),
