@@ -9,11 +9,12 @@ result is the small npz that ``--sam3d_npz`` takes.
 Adapted from ``core/four_d_anyone/pose.py`` in ComfyUI-SplatKit by mickmumpitz, which is
 MIT-licensed (see ``third_party/licenses/SPLATKIT_LICENSE``).
 
-The loader is ours for one reason that is not a preference: ComfyUI's own loader picks
-float16 on any card that supports it and installs no manual cast, and with hand
-refinement on the decoder feeds a float32 intermediate into those half weights and dies
-on ``mat1 and mat2 must have the same dtype``. Building in float32 avoids that, at 5.6 GB
-of weights instead of 2.8 GB. Everything else is the core loader, line for line.
+The loader is ours for one reason that is not a preference: ComfyUI's own loader stores the
+weights in half precision and installs no manual cast, and with hand refinement on the
+decoder feeds a float32 intermediate into those half weights and dies on ``mat1 and mat2
+must have the same dtype`` (checked against the core node on the bf16 checkpoint). Here the
+weights stay in the checkpoint's own dtype (2.8 GB for the bf16 file) and the ops cast them
+to float32 as each layer runs. Everything else is the core loader, line for line.
 
 ``comfy`` is imported inside the functions that need it, so this module imports cleanly
 in an interpreter without ComfyUI. It depends only on numpy, av and ``fdanyone.errors``.
@@ -73,7 +74,7 @@ def _read_frames(video: Path) -> np.ndarray:
 
 
 def load_model(model_file: str):
-    """The core's SAM3DBody_Loader with the dtype pinned to float32 (see the module docstring)."""
+    """The core's SAM3DBody_Loader with float32 compute over weights kept in the checkpoint's dtype (see the module docstring)."""
 
     import comfy.model_management
     import comfy.model_patcher
@@ -86,12 +87,12 @@ def load_model(model_file: str):
     state_dict = {key.replace(".layers.0.0.", ".layers.0."): value for key, value in state_dict.items()}
 
     load_device = comfy.model_management.get_torch_device()
-    dtype = torch.float32
+    dtype = comfy.utils.weight_dtype(state_dict) or torch.float32
     quant_config = comfy.utils.detect_layer_quantization(state_dict, "")
     if quant_config is not None:
         operations = comfy.ops.mixed_precision_ops(quant_config, dtype)
     else:
-        operations = comfy.ops.pick_operations(dtype, None, load_device=load_device, disable_fast_fp8=True)
+        operations = comfy.ops.pick_operations(dtype, torch.float32, load_device=load_device, disable_fast_fp8=True)
 
     model = SAM3DBody(dtype=dtype, operations=operations)
     state_dict.pop("hand_cls_embed.weight", None)
