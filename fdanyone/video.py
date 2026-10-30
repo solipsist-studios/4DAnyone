@@ -10,8 +10,11 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
+import logging
 import av
 import numpy as np
+
+_PAD_LOGGER = logging.getLogger(__name__)
 
 from fdanyone.config import INFERENCE
 from fdanyone.errors import VideoContractError
@@ -286,8 +289,16 @@ def decode_canonical_clip(
     num_frames: int = 121,
     start_time: float = 0.0,
     fps: str | int | float | Fraction | None = None,
+    pad_short: bool = False,
 ) -> CanonicalClip:
-    """Decode one canonical clip, selecting frames by source presentation time."""
+    """Decode one canonical clip, selecting frames by source presentation time.
+
+    LOCAL PATCH (ComfyUI pack, 2026-09-09): ``pad_short`` holds the last decoded frame
+    until ``num_frames`` is reached instead of refusing a short input. That is how every
+    clip shorter than the 121-frame contract was prepared for this project, and a node
+    user should not need ffmpeg for it. The padded frames are logged; they carry the last
+    frame's source index and timestamp.
+    """
 
     path = Path(video_path).expanduser().resolve()
     if not path.is_file():
@@ -349,6 +360,14 @@ def decode_canonical_clip(
                 selected.append(current)
                 target_index += 1
 
+        padded = 0
+        if len(selected) != num_frames and pad_short and 0 < len(selected) < num_frames:
+            padded = num_frames - len(selected)
+            _PAD_LOGGER.warning(
+                "Input has only %d of %d canonical frames; holding the last frame for the remaining %d.",
+                len(selected), num_frames, padded,
+            )
+            selected.extend([selected[-1]] * padded)
         if len(selected) != num_frames:
             duration = float(current.timestamp - origin)
             required = float(Fraction(num_frames - 1, 1) / output_rate + start_offset)
@@ -357,7 +376,9 @@ def decode_canonical_clip(
                 f"start_time={start_time}: decoded duration={duration:.3f}s, required={required:.3f}s."
             )
 
-        errors = [abs(frame.timestamp - target) for frame, target in zip(selected, targets, strict=True)]
+        real = num_frames - padded
+        errors = [abs(frame.timestamp - target)
+                  for frame, target in zip(selected[:real], targets[:real], strict=True)]
         if max(errors) > max_error:
             raise VideoContractError(
                 "Input timestamps contain a gap too large for stable sampling: "
@@ -421,7 +442,7 @@ def write_lossless_video(clip: CanonicalClip, path: str | Path) -> Path:
     return output_path
 
 
-def write_gvhmr_video(clip: CanonicalClip, path: str | Path) -> Path:
+def write_working_video(clip: CanonicalClip, path: str | Path) -> Path:
     """Write the frame-counted, RGB-lossless MP4 consumed by GVHMR.
 
     GVHMR's imageio metadata probe cannot determine the frame count of an

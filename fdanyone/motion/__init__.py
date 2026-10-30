@@ -1,4 +1,4 @@
-"""GVHMR motion recovery."""
+"""Per-clip body-pose results."""
 
 from fdanyone.motion.result import MotionResult
 

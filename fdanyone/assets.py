@@ -26,34 +26,29 @@ BIREFNET_FILES = (
     "model.safetensors",
 )
 
-CHECKPOINT = "4danyone/model.safetensors"
-MHR70_REGRESSOR = "4danyone/smplx_to_goliath70.pt"
-WAN_VAE = "4danyone/Wan2.2_VAE.pth"
-PROMPT_CONTEXT = "4danyone/prompt_context.safetensors"
+# SAM 3D Body pose weights (Meta's SAM License). Stored under models/sam3d/ with the
+# repository's own detection/ prefix, which is also the folder ComfyUI reads them from.
+SAM3D_REPO_ID = "Comfy-Org/sam-3d-body"
+SAM3D_REVISION = "7c974aea58e062252a6cb5b6f9b7f639d545b729"
+SAM3D_DIR = "sam3d"
+SAM3D_WEIGHTS = "detection/sam_3d_body_dinov3_bf16.safetensors"
 
-TURBO_LORA = "4danyone/Wan22_TI2V_5B_Turbo_lora_rank_64_fp16.safetensors"
+CHECKPOINT = "model.safetensors"
+WAN_VAE = "Wan2.2_VAE.pth"
+PROMPT_CONTEXT = "prompt_context.safetensors"
+
+TURBO_LORA = "Wan22_TI2V_5B_Turbo_lora_rank_64_fp16.safetensors"
 TURBO_LORA_NAME = "wan22_ti2v_5b_turbo_lora"
 TURBO_LORA_SIZE_BYTES = 332_348_584
 TURBO_LORA_SHA256 = "0ace5244e3d1256f884662c261b017249796cf5b95f05d5ed93cc02a478967b8"
 
-GVHMR_CHECKPOINT = "gvhmr/gvhmr_siga24_release.ckpt"
-HMR2_CHECKPOINT = "gvhmr/epoch=10-step=25000.ckpt"
-VITPOSE_CHECKPOINT = "gvhmr/vitpose-h-multi-coco.pth"
-YOLO_CHECKPOINT = "gvhmr/yolov8x.pt"
 PERCEPTUAL_VGG19 = "perceptual/imagenet-vgg-verydeep-19-conv.safetensors"
 
-SMPLX_MODEL = "body_models/smplx/SMPLX_NEUTRAL.npz"
 
 MODEL_FILES = (
     CHECKPOINT,
-    MHR70_REGRESSOR,
     WAN_VAE,
     PROMPT_CONTEXT,
-    GVHMR_CHECKPOINT,
-    HMR2_CHECKPOINT,
-    VITPOSE_CHECKPOINT,
-    YOLO_CHECKPOINT,
-    PERCEPTUAL_VGG19,
     TURBO_LORA,
 )
 
@@ -80,15 +75,6 @@ EXAMPLE_FILES = (
     "data/source/pexels/8431510-uhd_2160_4096_25fps.mp4",
 )
 
-# Upstream GVHMR resolves its model files relative to its own checkout, so the
-# install commands link each downloaded file to the location GVHMR expects.
-GVHMR_LINKS = (
-    (GVHMR_CHECKPOINT, "inputs/checkpoints/gvhmr/gvhmr_siga24_release.ckpt"),
-    (HMR2_CHECKPOINT, "inputs/checkpoints/hmr2/epoch=10-step=25000.ckpt"),
-    (VITPOSE_CHECKPOINT, "inputs/checkpoints/vitpose/vitpose-h-multi-coco.pth"),
-    (YOLO_CHECKPOINT, "inputs/checkpoints/yolo/yolov8x.pt"),
-    (SMPLX_MODEL, "inputs/checkpoints/body_models/smplx/SMPLX_NEUTRAL.npz"),
-)
 
 
 @dataclass(frozen=True)
@@ -110,13 +96,13 @@ def resolve_checkpoint(path: str | Path | None = None, model_dir: str | Path = "
         if not resolved.is_file():
             raise AssetError(f"Checkpoint override does not exist: {resolved}")
         return resolved
-    return _require_file(Path(model_dir) / CHECKPOINT, "Checkpoint", "scripts/download_model.py")
+    return _require_file(Path(model_dir) / "4danyone" / CHECKPOINT, "Checkpoint", "scripts/download_model.py")
 
 
-def resolve_turbo_lora(model_dir: str | Path = "models") -> Path:
+def resolve_turbo_lora(model_dir: str | Path = "models", *, path: str | Path | None = None) -> Path:
     """Resolve and authenticate the exact Wan2.2 5B Turbo LoRA."""
 
-    resolved = _require_file(Path(model_dir) / TURBO_LORA, "Turbo LoRA", "scripts/download_model.py")
+    resolved = _require_file(Path(path) if path else Path(model_dir) / "4danyone" / TURBO_LORA, "Turbo LoRA", "scripts/download_model.py")
     size = resolved.stat().st_size
     if size != TURBO_LORA_SIZE_BYTES:
         raise AssetError(f"Turbo LoRA size mismatch: {size} != {TURBO_LORA_SIZE_BYTES} bytes ({resolved})")
@@ -126,20 +112,23 @@ def resolve_turbo_lora(model_dir: str | Path = "models") -> Path:
     return resolved
 
 
-def resolve_regressor(path: str | Path | None = None, model_dir: str | Path = "models") -> Path:
-    if path is not None:
-        resolved = Path(path).expanduser().resolve()
-        if not resolved.is_file():
-            raise AssetError(f"MHR70 regressor override does not exist: {resolved}")
-        return resolved
-    return _require_file(Path(model_dir) / MHR70_REGRESSOR, "MHR70 regressor", "scripts/download_model.py")
 
 
-def resolve_foreground_model(model_dir: str | Path = "models") -> Path:
-    root = Path(model_dir).expanduser() / BIREFNET_DIR
+def resolve_foreground_model(model_dir: str | Path = "models", *, path: str | Path | None = None) -> Path:
+    root = Path(path).expanduser() if path else Path(model_dir).expanduser() / BIREFNET_DIR
     for relative in BIREFNET_FILES:
         _require_file(root / relative, "BiRefNet file", "scripts/download_model.py")
     return root.resolve()
+
+
+def resolve_sam3d_weights(model_dir: str | Path = "models") -> Path:
+    """Resolve the SAM 3D Body weights downloaded by ``scripts/download_model.py``."""
+
+    return _require_file(
+        Path(model_dir) / SAM3D_DIR / SAM3D_WEIGHTS,
+        "SAM 3D Body weights",
+        "scripts/download_model.py",
+    )
 
 
 def resolve_perceptual_vgg19(model_dir: str | Path = "models") -> Path:
@@ -152,11 +141,12 @@ def resolve_perceptual_vgg19(model_dir: str | Path = "models") -> Path:
     )
 
 
-def resolve_base_assets(model_dir: str | Path = "models") -> BaseAssets:
+def resolve_base_assets(model_dir: str | Path = "models", *, vae_path: str | Path | None = None,
+                        prompt_context_path: str | Path | None = None) -> BaseAssets:
     """Resolve the local VAE and frozen prompt conditioning."""
 
-    root = Path(model_dir).expanduser()
+    root = Path(model_dir).expanduser() / "4danyone"
     return BaseAssets(
-        vae=_require_file(root / WAN_VAE, "VAE", "scripts/download_model.py"),
-        prompt_context=_require_file(root / PROMPT_CONTEXT, "Prompt conditioning", "scripts/download_model.py"),
+        vae=_require_file(Path(vae_path) if vae_path else root / WAN_VAE, "VAE", "scripts/download_model.py"),
+        prompt_context=_require_file(Path(prompt_context_path) if prompt_context_path else root / PROMPT_CONTEXT, "Prompt conditioning", "scripts/download_model.py"),
     )
