@@ -21,6 +21,8 @@ from fdanyone.assets import (
     HF_REPO_ID,
     HF_REVISION,
     MODEL_FILES,
+    WAN_VAE,
+    WAN_VAE_FILES,
     PERCEPTUAL_VGG19,
     SAM3D_DIR,
     SAM3D_REPO_ID,
@@ -118,6 +120,8 @@ def ensure_models(model_dir: str | Path = "models", *, enable_turbo: bool = True
             continue
         if name == TURBO_LORA and not enable_turbo:
             continue
+        if name == WAN_VAE and any((models / "4danyone" / alt).is_file() and (models / "4danyone" / alt).stat().st_size > 0 for alt in WAN_VAE_FILES):
+            continue  # an existing safetensors VAE is as good as the .pth
         destination = models / "4danyone" / name
         if not destination.is_file() or destination.stat().st_size == 0:
             models.mkdir(parents=True, exist_ok=True)

@@ -48,6 +48,8 @@ Models are not downloaded during inference. One command fetches everything it ne
 python scripts/download_model.py
 ```
 
+The Wan2.2 VAE is looked up as `models/4danyone/Wan2.2_VAE.pth`, then `models/4danyone/Wan2.2_VAE.safetensors` (the `.pth` wins if both exist). To reuse a copy you already have, such as ComfyUI's `wan2.2_vae.safetensors`, pass it as `vae_path` (`--vae_path` on the command line); `.safetensors`, `.pth`, `.pt` and `.bin` are all accepted and hold the same tensors. `download_model.py` skips the VAE download when either file is present.
+
 The example clips are optional: `python scripts/download_example.py`.
 
 ## Inference

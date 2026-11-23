@@ -12,6 +12,7 @@ from pathlib import Path
 
 from fdanyone.errors import AssetError
 from fdanyone.io import sha256_file
+from fdanyone.weights_io import WEIGHT_SUFFIXES, is_weights_file
 
 HF_REPO_ID = "AntResearch/4DAnyone"
 HF_REVISION = "4c80e87b805a5f8461cf339cdbe2fb4249e585aa"
@@ -35,6 +36,10 @@ SAM3D_WEIGHTS = "detection/sam_3d_body_dinov3_bf16.safetensors"
 
 CHECKPOINT = "model.safetensors"
 WAN_VAE = "Wan2.2_VAE.pth"
+# The same tensors also ship as ComfyUI's float16 safetensors. Under <model_dir>/4danyone/
+# the published .pth wins when both exist, so existing installs resolve exactly as before.
+WAN_VAE_SAFETENSORS = "Wan2.2_VAE.safetensors"
+WAN_VAE_FILES = (WAN_VAE, WAN_VAE_SAFETENSORS)
 PROMPT_CONTEXT = "prompt_context.safetensors"
 
 TURBO_LORA = "Wan22_TI2V_5B_Turbo_lora_rank_64_fp16.safetensors"
@@ -141,12 +146,30 @@ def resolve_perceptual_vgg19(model_dir: str | Path = "models") -> Path:
     )
 
 
+def _resolve_vae(root: Path, vae_path: str | Path | None) -> Path:
+    if vae_path:
+        resolved = _require_file(Path(vae_path), "VAE", "scripts/download_model.py")
+        if not is_weights_file(resolved):
+            raise AssetError(
+                f"VAE file {resolved} must end in one of {', '.join(WEIGHT_SUFFIXES)}."
+            )
+        return resolved
+    for name in WAN_VAE_FILES:
+        candidate = (root / name).expanduser().resolve()
+        if candidate.is_file():
+            return candidate
+    raise AssetError(
+        f"VAE does not exist: looked for {' or '.join(WAN_VAE_FILES)} in {root.resolve()}. "
+        "Run `python scripts/download_model.py` to install it."
+    )
+
+
 def resolve_base_assets(model_dir: str | Path = "models", *, vae_path: str | Path | None = None,
                         prompt_context_path: str | Path | None = None) -> BaseAssets:
     """Resolve the local VAE and frozen prompt conditioning."""
 
     root = Path(model_dir).expanduser() / "4danyone"
     return BaseAssets(
-        vae=_require_file(Path(vae_path) if vae_path else root / WAN_VAE, "VAE", "scripts/download_model.py"),
+        vae=_resolve_vae(root, vae_path),
         prompt_context=_require_file(Path(prompt_context_path) if prompt_context_path else root / PROMPT_CONTEXT, "Prompt conditioning", "scripts/download_model.py"),
     )

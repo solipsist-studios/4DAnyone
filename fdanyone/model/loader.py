@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from fdanyone.config import DenoisingProfile
 from fdanyone.errors import AssetError, ConfigurationError
+from fdanyone.weights_io import load_state_dict
 
 if TYPE_CHECKING:
     import torch
@@ -49,22 +50,7 @@ def _load_checkpoint(
     include_prefix: str | None = None,
     exclude_prefixes: tuple[str, ...] = (),
 ):
-    try:
-        from safetensors import safe_open
-    except ImportError as exc:
-        raise AssetError("safetensors is required to load the 4DAnyone checkpoint.") from exc
-    with safe_open(str(path), framework="pt", device="cpu") as checkpoint:
-        checkpoint_keys = checkpoint.keys()
-        keys = (
-            key
-            for key in checkpoint_keys
-            if (include_prefix is None or key.startswith(include_prefix))
-            and not any(key.startswith(prefix) for prefix in exclude_prefixes)
-        )
-        return (
-            {key: checkpoint.get_tensor(key) for key in keys},
-            dict(checkpoint.metadata() or {}),
-        )
+    return load_state_dict(path, include_prefix=include_prefix, exclude_prefixes=exclude_prefixes)
 
 
 def _strict_assign(module, state_dict: dict, label: str) -> None:
@@ -99,16 +85,11 @@ def _merge_lora_factors(state_dict: dict) -> None:
 
     import torch
 
-    try:
-        from safetensors.torch import load_file
-    except ImportError as exc:
-        raise AssetError("safetensors is required to merge LoRA factors.") from exc
-
     resolved = Path(lora_path).expanduser().resolve()
     if not resolved.is_file():
         raise AssetError(f"FDANYONE_LORA_PATH does not exist: {resolved}")
 
-    factors = load_file(str(resolved))
+    factors, _ = load_state_dict(resolved)
     bases = sorted({key[: -len(".up")] for key in factors if key.endswith(".up")})
     merged: int = 0
     missing: list[str] = []
@@ -177,7 +158,7 @@ def _load_vae(path: Path, dtype):
 
     from fdanyone.vendor.diffsynth.models.wan_video_vae import WanVideoVAE38
 
-    state_dict = torch.load(path, map_location="cpu", weights_only=True)
+    state_dict, _ = load_state_dict(path)
     state_dict = WanVideoVAE38.state_dict_converter().from_civitai(state_dict)
     with torch.device("meta"):
         vae = WanVideoVAE38()
